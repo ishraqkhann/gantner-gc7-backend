@@ -23,14 +23,18 @@ ws.on('open', () => {
   console.log('connected to', url);
   send({ Cmd: 'Login', MT: 'Req', Data: { User: 'gc7', Token: '' } });
   send({ Cmd: 'Heartbeat', MT: 'Req', Data: {} });
-  // plain scan
-  send({ Cmd: 'Identification', MT: 'Req', Data: { Reader: 1, Barcode: scanValue } });
-  // GC7 QR template: GANTNER#<Id>#<Timestamp>#<Challenge>
-  send({ Cmd: 'Identification', MT: 'Req', Data: { Reader: 1, Barcode: `GANTNER#${scanValue}#1719230400#a1b2c3d4e5` } });
-  // realistic App.CardIdent shape (identifier buried in Segments)
-  send({ Cmd: 'App.CardIdent', MT: 'Evt', Data: { Segments: [{ SegmentType: 'BARCODE_DATA', Data: `GANTNER#${scanValue}#1719230400#zz99` }] } });
-  // denied
-  send({ Cmd: 'Identification', MT: 'Req', Data: { Reader: 1, Barcode: 'NOT_ALLOWED_999' } });
+  // Observed real GC7 v3.9.1 / G7 Advanced Access App scan events (Q300 over RS232).
+  // These are MT:'Evt' notifications — the server logs/captures them but (capture
+  // phase) does NOT respond.
+  send({ Cmd: 'IO.TagInReader', MT: 'Evt', Data: { Device: 'READER1', Reader: 1, Tag: scanValue } });
+  send({ Cmd: 'FIU.Identification', MT: 'Evt', Data: { Device: 'READER1', Identification: scanValue } });
+  // QR template form, identifier buried inside a value
+  send({ Cmd: 'IO.TagInReader', MT: 'Evt', Data: { Device: 'READER2', Reader: 2, Barcode: `GANTNER#${scanValue}#1719230400#zz99` } });
+  // unreadable scan + a non-allowed value
+  send({ Cmd: 'IO.InvalidTagInReader', MT: 'Evt', Data: { Device: 'READER1', Reader: 1 } });
+  send({ Cmd: 'FIU.Identification', MT: 'Evt', Data: { Device: 'READER1', Identification: 'NOT_ALLOWED_999' } });
+  // other observed traffic (captured, not responded to)
+  send({ Cmd: 'IO.RelayStateChanged', MT: 'Evt', Data: { Relay: 1, State: false } });
 
   // give the server a moment to respond, then exit
   setTimeout(() => ws.close(), 1500);

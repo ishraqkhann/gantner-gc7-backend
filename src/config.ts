@@ -17,4 +17,12 @@ export const config = {
 
   /** Heartbeat interval (seconds) advertised back to the controller (HBI). */
   heartbeatInterval: parseInt(process.env.HEARTBEAT_INTERVAL ?? '30', 10),
+
+  /**
+   * Send a `RegisterEvent` subscription on connect. OFF by default (capture
+   * phase). Flip to true only if scans don't arrive — it asks the controller to
+   * push events. Filter is configurable (some firmwares need a namespace).
+   */
+  registerEvents: (process.env.GANTNER_REGISTER_EVENTS ?? 'false').toLowerCase() === 'true',
+  registerEventFilter: process.env.GANTNER_REGISTER_FILTER ?? '*',
 };

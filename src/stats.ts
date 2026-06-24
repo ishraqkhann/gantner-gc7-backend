@@ -34,6 +34,33 @@ export const lastSeen = {
 
 export const connections = new Map<number, ConnInfo>();
 
+/* ------------------------------------------------------------------ *
+ * Packet capture ring buffer (for GET /recent)
+ * ------------------------------------------------------------------ *
+ * Holds the last N inbound frames so we can inspect exactly what the GC7 sends
+ * over HTTP, without the platform log API. Bring-up tool — may contain
+ * identifiers; protect or remove before long-term production exposure.
+ */
+export interface CapturedMessage {
+  ts: string;
+  connId: number;
+  cmd?: string;
+  mt?: string;
+  isAccess: boolean;
+  raw: string;
+  parsed?: unknown;
+}
+
+const MAX_CAPTURE = 120;
+export const recentMessages: CapturedMessage[] = [];
+
+export function capture(m: CapturedMessage): void {
+  recentMessages.push(m);
+  if (recentMessages.length > MAX_CAPTURE) {
+    recentMessages.splice(0, recentMessages.length - MAX_CAPTURE);
+  }
+}
+
 export function statusSnapshot() {
   const now = Date.now();
   return {

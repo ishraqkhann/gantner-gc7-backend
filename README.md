@@ -21,15 +21,24 @@ https://api.claphouse.club/health     (health check → { "ok": true })
 |---|-----------|
 | 1 | Express HTTP server |
 | 2 | `GET /health` → `{ "ok": true }` |
-| 3 | WebSocket endpoint at `/gantner` (other paths are rejected) |
-| 4 | Accepts GC7 WebSocket connections |
-| 5 | Logs **every** inbound message — raw **and** parsed |
+| 3 | WebSocket endpoint at `/gantner` (server accepts any path, so a bare host works too) |
+| 4 | Accepts GC7 WebSocket connections; logs connection IP + headers |
+| 5 | Logs **every** inbound message — raw **and** parsed (pino → stdout + file) |
 | 6 | Responds to `Heartbeat` (exact required format) |
-| 7 | Responds to `Login` |
-| 8 | Detects access/scan messages containing any of: `Tag`, `Barcode`, `Identification`, `Reader`, `Card`, `Access`, `CheckIn` |
+| 7 | Responds to `Login` with `State: 0`, `Data: {}` |
+| 8 | Detects access/scan messages by `Cmd`/`Data` containing: `Tag`, `Barcode`, `Identification`, `Reader`, `Card`, `Access`, `CheckIn`, `FIU`, `IO.TagInReader`, `IO.InvalidTagInReader` |
 | 9 | Grants only these identifiers (temporary allow-list): `TEST123456`, `HELLO_WORLD`, `12345678` |
-| 10 | Does **not** send an unlock command yet — it **logs the command it would send** |
+| 10 | Does **not** send an unlock command yet — `placeholderUnlock()` **logs what it would send** (`App.StartUnlockProcess` grant / `App.StartDenyProcess` deny, echoing `Device`) |
 | 11 | Writes logs to `./logs/gantner-events.log` |
+| 12 | `GET /status` — live connection/heartbeat/access counters (no identifiers) |
+| 13 | `GET /recent` — last ~120 captured raw packets (newest first; `?all=1` includes heartbeats) |
+
+> **Capture phase:** only `Heartbeat` and `Login` get responses. Access/scan
+> events and everything else (`IO.*`, `FIU.*`, `Addon.*`, `Config.*`) are
+> **logged & captured but not answered** — so we can observe the real GC7
+> traffic before committing to the online grant/unlock flow. Real scan events
+> seen on GC7 v3.9.1 / G7 Advanced Access App: `IO.TagInReader`,
+> `IO.InvalidTagInReader`, `FIU.Identification`.
 
 ### Message envelope
 

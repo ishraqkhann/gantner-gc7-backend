@@ -6,7 +6,7 @@ import { URL } from 'url';
 import { config } from './config';
 import { log, LOG_FILE_PATH } from './logger';
 import { GantnerMessage, handleMessage } from './gantner';
-import { connections, totals, lastSeen, statusSnapshot } from './stats';
+import { connections, totals, lastSeen, statusSnapshot, capture, recentMessages } from './stats';
 
 const WS_PATH = '/gantner';
 
@@ -25,9 +25,17 @@ app.get('/status', (_req, res) => {
   res.json(statusSnapshot());
 });
 
+// Captured raw packets (newest first). Heartbeats hidden unless ?all=1.
+// Bring-up tool to SEE exactly what the GC7 sends.
+app.get('/recent', (req, res) => {
+  const all = String(req.query.all ?? '') === '1';
+  const items = [...recentMessages].reverse().filter((m) => all || m.cmd !== 'Heartbeat');
+  res.json({ count: items.length, messages: items.slice(0, 60) });
+});
+
 // Friendly root
 app.get('/', (_req, res) => {
-  res.json({ service: 'gantner-gc7-backend', ws: WS_PATH, health: '/health', status: '/status' });
+  res.json({ service: 'gantner-gc7-backend', ws: WS_PATH, health: '/health', status: '/status', recent: '/recent' });
 });
 
 const server = http.createServer(app);
@@ -39,6 +47,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 let connectionSeq = 0;
+let outboundTid = 9000; // TID for server-originated requests (e.g. RegisterEvent)
 
 server.on('upgrade', (req, socket, head) => {
   let pathname = '/';
@@ -89,7 +98,16 @@ wss.on('connection', (ws: WebSocket, req) => {
     authPresent,
   });
 
-  log('info', 'ws.connected', { connId, remote, ua: req.headers['user-agent'], authPresent });
+  // (2) Log connection IP + headers.
+  log('info', 'ws.connected', { connId, remote, headers: req.headers, authPresent });
+
+  // Optional: ask the controller to push events. OFF by default (capture phase);
+  // flip GANTNER_REGISTER_EVENTS=true only if scans don't arrive on their own.
+  if (config.registerEvents) {
+    const sub = { Cmd: 'RegisterEvent', MT: 'Req', TID: ++outboundTid, Data: { Event: config.registerEventFilter } };
+    ws.send(JSON.stringify(sub));
+    log('info', 'ws.register_event_sent', { connId, sub });
+  }
 
   ws.on('message', (raw: Buffer, isBinary: boolean) => {
     const rawText = isBinary ? `<binary ${raw.length} bytes>` : raw.toString('utf8');
@@ -110,9 +128,18 @@ wss.on('connection', (ws: WebSocket, req) => {
 
     const result = handleMessage(msg);
 
-    // ---- stats ----
+    // ---- stats + capture ----
     const seenAt = new Date().toISOString();
     totals.messages += 1;
+    capture({
+      ts: seenAt,
+      connId,
+      cmd: typeof msg.Cmd === 'string' ? msg.Cmd : undefined,
+      mt: typeof msg.MT === 'string' ? msg.MT : undefined,
+      isAccess: result.kind === 'access',
+      raw: rawText,
+      parsed: msg,
+    });
     const conn = connections.get(connId);
     if (conn) {
       conn.messages += 1;

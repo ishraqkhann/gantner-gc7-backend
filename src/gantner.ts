@@ -43,10 +43,23 @@ export const ALLOWED_IDENTIFIERS = new Set<string>(['TEST123456', 'HELLO_WORLD',
 
 const nowIso = (): string => new Date().toISOString();
 
+/**
+ * Cmd substrings that mark an access / scan / identification event. Includes the
+ * REAL command names observed in GC7 v3.9.1 / G7 Advanced Access App v1.9.0 logs
+ * (FIU.Identification, IO.TagInReader, IO.InvalidTagInReader) plus the generic
+ * semantic keys.
+ */
+export const ACCESS_CMD_HINTS = [
+  ...ACCESS_KEYS,
+  'FIU',
+  'IO.TagInReader',
+  'IO.InvalidTagInReader',
+] as const;
+
 /** True if this looks like an access / scan / identification message. */
 export function isAccessMessage(msg: GantnerMessage): boolean {
   const cmd = (msg.Cmd ?? '').toString().toLowerCase();
-  if (ACCESS_KEYS.some((k) => cmd.includes(k.toLowerCase()))) return true;
+  if (ACCESS_CMD_HINTS.some((k) => cmd.includes(k.toLowerCase()))) return true;
 
   const data = msg.Data ?? {};
   return ACCESS_KEYS.some((k) => k in data) || ACCESS_KEYS.some((k) => k in msg);
@@ -141,17 +154,41 @@ export function buildHeartbeatResponse(msg: GantnerMessage): GantnerMessage {
   };
 }
 
-/** Login response. We accept the login during bring-up (State 0). */
+/** Login response — per spec, empty Data. We accept the login during bring-up. */
 export function buildLoginResponse(msg: GantnerMessage): GantnerMessage {
   return {
     Cmd: 'Login',
     MT: 'Rsp',
     TID: msg.TID,
     State: 0,
-    Data: {
-      HBI: config.heartbeatInterval,
-      RT: nowIso(),
-    },
+    Data: {},
+  };
+}
+
+/**
+ * (10) PLACEHOLDER unlock — builds (and the caller LOGS) what we WOULD send, but
+ * we transmit NOTHING. Command names (App.StartUnlockProcess grant /
+ * App.StartDenyProcess deny) are corroborated by two reference backends, and the
+ * event's `Device` must be echoed so the right door reacts — but the exact Data
+ * shape is unconfirmed for this firmware, so nothing is sent until we confirm it
+ * from the controller's own IN/OUT log.
+ */
+export function placeholderUnlock(
+  msg: GantnerMessage,
+  decision: 'GRANTED' | 'DENIED',
+): GantnerMessage {
+  const device = (msg.Data as Record<string, unknown> | undefined)?.Device ?? null;
+  if (decision === 'GRANTED') {
+    return {
+      Cmd: 'App.StartUnlockProcess',
+      MT: 'Req',
+      Data: { DisplayText: 'Welcome', Device: device, Note: 'PLACEHOLDER grant — NOT sent' },
+    };
+  }
+  return {
+    Cmd: 'App.StartDenyProcess',
+    MT: 'Req',
+    Data: { DisplayText: 'Access denied', Device: device, Note: 'PLACEHOLDER deny — NOT sent' },
   };
 }
 
@@ -240,35 +277,22 @@ export function handleMessage(msg: GantnerMessage): HandleResult {
       });
     }
 
-    if (granted) {
-      // (10) We do NOT yet know the real GC7.3000 unlock/door-open command.
-      //      Best current guess (low confidence): App.StartUnlockProcess.
-      //      Per spec: LOG what we would send, but do NOT send it.
-      const wouldSend: GantnerMessage = {
-        Cmd: 'App.StartUnlockProcess', // PLACEHOLDER (low confidence) — confirm before enabling
-        MT: 'Req',
-        TID: msg.TID,
-        Data: {
-          UnlockingTime_ms: 5000,
-          Relays: [{ Id: 1, OnTime_ms: 5000 }],
-          DisplayText: 'Access granted',
-          Note: 'PLACEHOLDER unlock — NOT sent',
-        },
-      };
-      log('warn', 'gantner.unlock_would_send', {
-        note: 'Unlock command NOT sent — real GC7 command unconfirmed (App.StartUnlockProcess is a low-confidence guess).',
-        identifier: matched,
-        wouldSend,
-      });
+    // (10) Placeholder unlock — LOG what we would send; transmit nothing.
+    const decision: 'GRANTED' | 'DENIED' = granted ? 'GRANTED' : 'DENIED';
+    const wouldSend = placeholderUnlock(msg, decision);
+    log('warn', 'gantner.unlock_would_send', {
+      decision,
+      identifier: matched ?? null,
+      note: 'Capture phase — nothing sent to controller. This is what we WOULD send.',
+      wouldSend,
+    });
 
-      // Acknowledge the event (so the controller does not retry) but do NOT unlock.
-      return { response: buildAck(msg), wouldSend, kind: 'access', decision: 'GRANTED' };
-    }
-
-    return { response: buildAck(msg), kind: 'access', decision: 'DENIED' };
+    // Capture phase: LOG access events; do NOT respond to scans yet.
+    return { response: null, wouldSend, kind: 'access', decision };
   }
 
-  // Anything else: log and acknowledge.
+  // Anything else (GetDeviceInfo, IO.*, Addon.*, Config.*, Evt notifications):
+  // capture-log it. Only Heartbeat and Login receive responses for now.
   log('info', 'gantner.unhandled', { cmd, mt, tid: msg.TID, data: msg.Data });
-  return { response: buildAck(msg), kind: 'other' };
+  return { response: null, kind: 'other' };
 }
