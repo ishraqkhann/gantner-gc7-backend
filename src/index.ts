@@ -57,21 +57,11 @@ const wss = new WebSocketServer({ noServer: true });
 let connectionSeq = 0;
 let outboundTid = 9000; // TID for server-originated requests (e.g. RegisterEvent)
 
-// Candidate RegisterEvent subscription shapes. We fire all of them on connect
-// and read /recent to see which TID the controller answered with State:0 — that's
-// the format that subscribes us to scan events. (Initial guess {Event:'*'} got State:1.)
-const REGISTER_EVENT_PROBES: Record<string, unknown>[] = [
-  { Event: '*' },
-  { Events: ['*'] },
-  { Event: 'IO.*' },
-  { Events: ['IO.*', 'FIU.*'] },
-  {},
-  { Filter: '*' },
-  { EventMask: '*' },
-  { Name: '*' },
-  { Event: 'All' },
-  { Events: ['IO.TagInReader', 'IO.BarcodeRead', 'FIU.Identification'] },
-];
+// CONFIRMED from probing the live controller: RegisterEvent accepts
+// Data:{Event:'<namespace>.*'} — a single Event field with ONE namespace
+// wildcard. {Event:'IO.*'} returned State:0; '*', arrays, {}, Filter/Mask/Name
+// all returned State:1. Subscribe to each namespace with its own request.
+const REGISTER_EVENT_SUBSCRIPTIONS = ['IO.*', 'FIU.*', 'Addon.*'];
 
 server.on('upgrade', (req, socket, head) => {
   let pathname = '/';
@@ -136,9 +126,9 @@ wss.on('connection', (ws: WebSocket, req) => {
   // Optional: ask the controller to push events. OFF by default (capture phase);
   // flip GANTNER_REGISTER_EVENTS=true only if scans don't arrive on their own.
   if (config.registerEvents) {
-    for (const data of REGISTER_EVENT_PROBES) {
+    for (const ev of REGISTER_EVENT_SUBSCRIPTIONS) {
       const tid = ++outboundTid;
-      const frame = { Cmd: 'RegisterEvent', MT: 'Req', TID: tid, Data: data };
+      const frame = { Cmd: 'RegisterEvent', MT: 'Req', TID: tid, Data: { Event: ev } };
       ws.send(JSON.stringify(frame));
       capture({
         ts: new Date().toISOString(),
@@ -150,7 +140,7 @@ wss.on('connection', (ws: WebSocket, req) => {
         raw: JSON.stringify(frame),
         parsed: frame,
       });
-      log('info', 'ws.register_event_probe', { connId, tid, data });
+      log('info', 'ws.register_event_sent', { connId, tid, event: ev });
     }
   }
 
