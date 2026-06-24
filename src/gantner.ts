@@ -175,6 +175,10 @@ export interface HandleResult {
   response: GantnerMessage | null;
   /** The unlock command we WOULD have sent (logged only, never sent yet). */
   wouldSend?: GantnerMessage;
+  /** Classification for stats/monitoring. */
+  kind?: 'heartbeat' | 'login' | 'access' | 'rsp' | 'other';
+  /** Access decision, when kind === 'access'. */
+  decision?: 'GRANTED' | 'DENIED';
 }
 
 export function handleMessage(msg: GantnerMessage): HandleResult {
@@ -184,21 +188,21 @@ export function handleMessage(msg: GantnerMessage): HandleResult {
   // The controller is replying to something WE sent. Just observe it.
   if (mt === 'Rsp') {
     log('info', 'gantner.rsp_received', { cmd, tid: msg.TID, state: msg.State });
-    return { response: null };
+    return { response: null, kind: 'rsp' };
   }
 
   // (6) Heartbeat
   if (cmd === 'Heartbeat') {
     const response = buildHeartbeatResponse(msg);
     log('info', 'gantner.heartbeat', { tid: msg.TID, response });
-    return { response };
+    return { response, kind: 'heartbeat' };
   }
 
   // (7) Login
   if (cmd === 'Login') {
     const response = buildLoginResponse(msg);
     log('info', 'gantner.login', { tid: msg.TID, data: msg.Data, response });
-    return { response };
+    return { response, kind: 'login' };
   }
 
   // (8) Access / scan / identification
@@ -258,13 +262,13 @@ export function handleMessage(msg: GantnerMessage): HandleResult {
       });
 
       // Acknowledge the event (so the controller does not retry) but do NOT unlock.
-      return { response: buildAck(msg), wouldSend };
+      return { response: buildAck(msg), wouldSend, kind: 'access', decision: 'GRANTED' };
     }
 
-    return { response: buildAck(msg) };
+    return { response: buildAck(msg), kind: 'access', decision: 'DENIED' };
   }
 
   // Anything else: log and acknowledge.
   log('info', 'gantner.unhandled', { cmd, mt, tid: msg.TID, data: msg.Data });
-  return { response: buildAck(msg) };
+  return { response: buildAck(msg), kind: 'other' };
 }

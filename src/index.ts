@@ -6,6 +6,7 @@ import { URL } from 'url';
 import { config } from './config';
 import { log, LOG_FILE_PATH } from './logger';
 import { GantnerMessage, handleMessage } from './gantner';
+import { connections, totals, lastSeen, statusSnapshot } from './stats';
 
 const WS_PATH = '/gantner';
 
@@ -19,9 +20,14 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
 
+// Live runtime stats — confirm the controller is connected & heartbeating.
+app.get('/status', (_req, res) => {
+  res.json(statusSnapshot());
+});
+
 // Friendly root
 app.get('/', (_req, res) => {
-  res.json({ service: 'gantner-gc7-backend', ws: WS_PATH, health: '/health' });
+  res.json({ service: 'gantner-gc7-backend', ws: WS_PATH, health: '/health', status: '/status' });
 });
 
 const server = http.createServer(app);
@@ -70,12 +76,20 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', (ws: WebSocket, req) => {
   const connId = ++connectionSeq;
   const remote = req.socket.remoteAddress;
-  log('info', 'ws.connected', {
+  const authPresent = Boolean(req.headers['authorization']);
+  const openedAt = new Date().toISOString();
+
+  totals.connectionsOpened += 1;
+  connections.set(connId, {
     connId,
     remote,
-    ua: req.headers['user-agent'],
-    authPresent: Boolean(req.headers['authorization']),
+    connectedAt: openedAt,
+    lastSeen: openedAt,
+    messages: 0,
+    authPresent,
   });
+
+  log('info', 'ws.connected', { connId, remote, ua: req.headers['user-agent'], authPresent });
 
   ws.on('message', (raw: Buffer, isBinary: boolean) => {
     const rawText = isBinary ? `<binary ${raw.length} bytes>` : raw.toString('utf8');
@@ -94,14 +108,43 @@ wss.on('connection', (ws: WebSocket, req) => {
     // (5) ...then the parsed form.
     log('info', 'ws.message_parsed', { connId, parsed: msg });
 
-    const { response } = handleMessage(msg);
-    if (response) {
-      ws.send(JSON.stringify(response));
-      log('info', 'ws.message_sent', { connId, sent: response });
+    const result = handleMessage(msg);
+
+    // ---- stats ----
+    const seenAt = new Date().toISOString();
+    totals.messages += 1;
+    const conn = connections.get(connId);
+    if (conn) {
+      conn.messages += 1;
+      conn.lastSeen = seenAt;
+      conn.lastCmd = typeof msg.Cmd === 'string' ? msg.Cmd : undefined;
+    }
+    switch (result.kind) {
+      case 'heartbeat':
+        totals.heartbeats += 1;
+        lastSeen.heartbeatAt = seenAt;
+        break;
+      case 'login':
+        totals.logins += 1;
+        lastSeen.loginAt = seenAt;
+        break;
+      case 'access':
+        totals.accessEvents += 1;
+        lastSeen.accessAt = seenAt;
+        lastSeen.accessDecision = result.decision ?? null;
+        if (result.decision === 'GRANTED') totals.accessGranted += 1;
+        else totals.accessDenied += 1;
+        break;
+    }
+
+    if (result.response) {
+      ws.send(JSON.stringify(result.response));
+      log('info', 'ws.message_sent', { connId, sent: result.response });
     }
   });
 
   ws.on('close', (code, reason) => {
+    connections.delete(connId);
     log('info', 'ws.closed', { connId, code, reason: reason.toString() });
   });
 
