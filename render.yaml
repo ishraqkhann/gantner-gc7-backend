@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: gantner-gc7-backend
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: GANTNER_ACCESS_TOKEN
+        sync: false
+      - key: HEARTBEAT_INTERVAL
+        value: "30"

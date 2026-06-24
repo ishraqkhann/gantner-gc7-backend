@@ -1,0 +1,20 @@
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+/**
+ * Central runtime configuration, sourced from environment / .env.
+ */
+export const config = {
+  /** HTTP + WebSocket listen port. Railway/Render inject PORT automatically. */
+  port: parseInt(process.env.PORT ?? '3000', 10),
+
+  /**
+   * Optional shared secret. Reserved for when we start *enforcing* GC7 Login
+   * credentials. Empty string => not enforced yet (current bring-up phase).
+   */
+  accessToken: process.env.GANTNER_ACCESS_TOKEN ?? '',
+
+  /** Heartbeat interval (seconds) advertised back to the controller (HBI). */
+  heartbeatInterval: parseInt(process.env.HEARTBEAT_INTERVAL ?? '30', 10),
+};
