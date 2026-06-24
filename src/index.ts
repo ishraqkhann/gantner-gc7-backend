@@ -42,27 +42,29 @@ server.on('upgrade', (req, socket, head) => {
     /* keep default */
   }
 
-  // (3)(4) Only accept WebSocket upgrades on /gantner.
-  if (pathname === WS_PATH) {
-    // Optional auth: the GC7 presents its access token in the Authorization
-    // header on the upgrade request. Enforced ONLY when GANTNER_ACCESS_TOKEN is
-    // set — empty (bring-up default) means accept any connection.
-    if (config.accessToken) {
-      const auth = (req.headers['authorization'] ?? '').toString();
-      if (!auth.includes(config.accessToken)) {
-        log('warn', 'ws.auth_rejected', { path: pathname, hasAuth: Boolean(auth) });
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
-      }
+  // Optional auth: the GC7 presents its access token in the Authorization
+  // header on the upgrade request. Enforced ONLY when GANTNER_ACCESS_TOKEN is
+  // set — empty (bring-up default) means accept any connection.
+  if (config.accessToken) {
+    const auth = (req.headers['authorization'] ?? '').toString();
+    if (!auth.includes(config.accessToken)) {
+      log('warn', 'ws.auth_rejected', { path: pathname, hasAuth: Boolean(auth) });
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
     }
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req);
-    });
-  } else {
-    log('warn', 'ws.upgrade_rejected', { path: pathname });
-    socket.destroy();
   }
+
+  // (3)(4) Accept the WS upgrade on /gantner (canonical) OR any path. The GC7
+  // External Webserver field may be a bare host with no path — exactly like the
+  // previous wss://7backend2026.sevenwellness.club target — so we do NOT reject
+  // on path; we just note when it isn't the canonical /gantner.
+  if (pathname !== WS_PATH) {
+    log('info', 'ws.upgrade_nonstandard_path', { path: pathname });
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
 });
 
 wss.on('connection', (ws: WebSocket, req) => {

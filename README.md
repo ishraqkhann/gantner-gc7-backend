@@ -206,9 +206,9 @@ In the controller web UI → **External Webserver** (replacing the current
 | Setting | Value |
 |---------|-------|
 | Protocol | `wss` (TLS) |
-| Host / URL | `wss://api.claphouse.club/gantner` |
+| Host / URL | `wss://gantner-gc7-backend.onrender.com` (bare host works; `/gantner` optional) |
 | Port | `443` (implicit for `wss`) |
-| Path | `/gantner` |
+| Path | `/gantner` canonical — server accepts **any** path, so path-less is fine |
 | Heartbeat interval | `30` s (server also advertises `HBI: 30`) |
 | Token / credential | sent as the `Authorization` header on connect; set `GANTNER_ACCESS_TOKEN` to enforce it (leave empty during bring-up) |
 
