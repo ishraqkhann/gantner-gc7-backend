@@ -48,6 +48,7 @@ export const connections = new Map<number, ConnInfo>();
 export interface CapturedMessage {
   ts: string;
   connId: number;
+  dir?: 'in' | 'out';
   cmd?: string;
   mt?: string;
   isAccess: boolean;
