@@ -6,6 +6,10 @@
 export interface ConnInfo {
   connId: number;
   remote?: string;
+  /** Real client IP from x-forwarded-for (the site's public IP behind NAT). */
+  clientIp?: string;
+  /** Stable fingerprint of the Authorization token — distinguishes the 4 gates. */
+  tokenFp?: string;
   connectedAt: string;
   lastSeen: string;
   messages: number;

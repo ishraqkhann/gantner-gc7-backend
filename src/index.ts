@@ -1,5 +1,6 @@
 import express from 'express';
 import http from 'http';
+import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { URL } from 'url';
 
@@ -9,6 +10,13 @@ import { GantnerMessage, handleMessage } from './gantner';
 import { connections, totals, lastSeen, statusSnapshot, capture, recentMessages } from './stats';
 
 const WS_PATH = '/gantner';
+
+/** Copy headers for logging, masking the Authorization secret to just its length. */
+function redactHeaders(h: http.IncomingHttpHeaders): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...h };
+  if (out.authorization) out.authorization = `***redacted(len=${String(out.authorization).length})`;
+  return out;
+}
 
 /* ----------------------------- HTTP ------------------------------ */
 
@@ -85,21 +93,29 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', (ws: WebSocket, req) => {
   const connId = ++connectionSeq;
   const remote = req.socket.remoteAddress;
-  const authPresent = Boolean(req.headers['authorization']);
+  const xff = (req.headers['x-forwarded-for'] ?? '').toString();
+  const clientIp = xff.split(',')[0]?.trim() || remote; // site public IP behind Render's proxy
+  const auth = (req.headers['authorization'] ?? '').toString();
+  const authPresent = Boolean(auth);
+  // Stable per-controller fingerprint so the 4 gates are distinguishable in /status
+  // without ever logging the secret token itself.
+  const tokenFp = auth ? crypto.createHash('sha256').update(auth).digest('hex').slice(0, 8) : undefined;
   const openedAt = new Date().toISOString();
 
   totals.connectionsOpened += 1;
   connections.set(connId, {
     connId,
     remote,
+    clientIp,
+    tokenFp,
     connectedAt: openedAt,
     lastSeen: openedAt,
     messages: 0,
     authPresent,
   });
 
-  // (2) Log connection IP + headers.
-  log('info', 'ws.connected', { connId, remote, headers: req.headers, authPresent });
+  // (2) Log connection IP + headers (Authorization redacted to its length).
+  log('info', 'ws.connected', { connId, remote, clientIp, tokenFp, headers: redactHeaders(req.headers), authPresent });
 
   // Optional: ask the controller to push events. OFF by default (capture phase);
   // flip GANTNER_REGISTER_EVENTS=true only if scans don't arrive on their own.
