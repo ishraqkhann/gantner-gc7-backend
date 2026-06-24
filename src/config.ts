@@ -23,6 +23,6 @@ export const config = {
    * phase). Flip to true only if scans don't arrive — it asks the controller to
    * push events. Filter is configurable (some firmwares need a namespace).
    */
-  registerEvents: (process.env.GANTNER_REGISTER_EVENTS ?? 'false').toLowerCase() === 'true',
+  registerEvents: (process.env.GANTNER_REGISTER_EVENTS ?? 'true').toLowerCase() === 'true',
   registerEventFilter: process.env.GANTNER_REGISTER_FILTER ?? '*',
 };
