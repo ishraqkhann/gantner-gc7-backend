@@ -37,9 +37,11 @@ export const ACCESS_KEYS = [
 
 /**
  * TEMPORARY allow-list. Only these identifiers are treated as "access granted"
- * during bring-up. Replace with a real membership lookup later.
+ * during commissioning. Scoped to TEST123456 only per current requirement
+ * ("for now only open with the TEST123456 QR"). Add more codes here, or replace
+ * with a real membership lookup, before going live.
  */
-export const ALLOWED_IDENTIFIERS = new Set<string>(['TEST123456', 'HELLO_WORLD', '12345678']);
+export const ALLOWED_IDENTIFIERS = new Set<string>(['TEST123456']);
 
 const nowIso = (): string => new Date().toISOString();
 
@@ -175,6 +177,24 @@ export const ENTRY_RELAY_ID = 1;
 export const EXIT_RELAY_ID = 2;
 
 /**
+ * Derive the door relay from the reader that produced the scan.
+ *   Reader 1 → Relay 1 (door 1),  Reader 2 → Relay 2 (door 2).
+ * The scan event carries the reader as `Data.ReaderId` (number, on
+ * IO.BarcodeRead) or `Data.ReaderID` (e.g. "BARCODE2", on IO.TagInReader).
+ * We open the relay matching whichever reader scanned — so a scan at reader 2
+ * opens door 2, not door 1. Defaults to Relay 1 if the reader can't be read.
+ */
+export function relayIdForMessage(msg: GantnerMessage): number {
+  const d = (msg.Data ?? {}) as Record<string, unknown>;
+  if (typeof d.ReaderId === 'number' && d.ReaderId >= 1) return d.ReaderId;
+  if (typeof d.ReaderID === 'string') {
+    const m = d.ReaderID.match(/(\d+)\s*$/);
+    if (m) return parseInt(m[1], 10);
+  }
+  return ENTRY_RELAY_ID;
+}
+
+/**
  * (10) Build the door-open command for a GRANTED scan.
  *
  * CONFIRMED from the controller's own G7 web UI bundle (wss://<controller>/api).
@@ -203,12 +223,11 @@ export function buildUnlock(
   decision: 'GRANTED' | 'DENIED',
 ): GantnerMessage | null {
   if (decision !== 'GRANTED') return null;
-  const device = (msg.Data as Record<string, unknown> | undefined)?.Device ?? null;
-  return {
-    Cmd: 'IO.SetRelayState',
-    MT: 'Req',
-    Data: { Id: ENTRY_RELAY_ID, State: true, Device: device },
-  };
+  const d = (msg.Data as Record<string, unknown> | undefined) ?? {};
+  const data: Record<string, unknown> = { Id: relayIdForMessage(msg), State: true };
+  // Echo Device only if the scan carried one (confirmed scan events don't).
+  if (d.Device !== undefined) data.Device = d.Device;
+  return { Cmd: 'IO.SetRelayState', MT: 'Req', Data: data };
 }
 
 /** Generic positive acknowledgement for messages we observe but don't yet act on. */

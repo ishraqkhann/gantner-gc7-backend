@@ -57,6 +57,11 @@ const wss = new WebSocketServer({ noServer: true });
 let connectionSeq = 0;
 let outboundTid = 9000; // TID for server-originated requests (e.g. RegisterEvent)
 
+// A single physical scan emits BOTH IO.BarcodeRead and IO.TagInReader (often
+// repeated). Collapse them to one relay pulse per door within this window.
+const UNLOCK_DEDUP_MS = 3000;
+const lastUnlockByRelay = new Map<number, number>();
+
 // CONFIRMED from probing the live controller: RegisterEvent accepts
 // Data:{Event:'<namespace>.*'} — a single Event field with ONE namespace
 // wildcard. {Event:'IO.*'} returned State:0; '*', arrays, {}, Filter/Mask/Name
@@ -209,19 +214,27 @@ wss.on('connection', (ws: WebSocket, req) => {
     // opens the Entry door. Gated by GANTNER_SEND_UNLOCK (default OFF). The
     // unlock is a server-originated Req, so it carries a fresh outbound TID.
     if (config.sendUnlock && result.kind === 'access' && result.decision === 'GRANTED' && result.wouldSend) {
-      const unlock = { ...result.wouldSend, TID: ++outboundTid };
-      ws.send(JSON.stringify(unlock));
-      capture({
-        ts: new Date().toISOString(),
-        connId,
-        dir: 'out',
-        cmd: 'IO.SetRelayState',
-        mt: 'Req',
-        isAccess: false,
-        raw: JSON.stringify(unlock),
-        parsed: unlock,
-      });
-      log('warn', 'ws.unlock_sent', { connId, tid: unlock.TID, sent: unlock });
+      const relayId = Number((result.wouldSend.Data as Record<string, unknown>)?.Id);
+      const now = Date.now();
+      const prev = lastUnlockByRelay.get(relayId) ?? 0;
+      if (now - prev < UNLOCK_DEDUP_MS) {
+        log('info', 'ws.unlock_skipped_dedup', { connId, relayId, sinceMs: now - prev });
+      } else {
+        lastUnlockByRelay.set(relayId, now);
+        const unlock = { ...result.wouldSend, TID: ++outboundTid };
+        ws.send(JSON.stringify(unlock));
+        capture({
+          ts: new Date().toISOString(),
+          connId,
+          dir: 'out',
+          cmd: 'IO.SetRelayState',
+          mt: 'Req',
+          isAccess: false,
+          raw: JSON.stringify(unlock),
+          parsed: unlock,
+        });
+        log('warn', 'ws.unlock_sent', { connId, tid: unlock.TID, relayId, sent: unlock });
+      }
     }
   });
 
