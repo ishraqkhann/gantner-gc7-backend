@@ -11,3 +11,8 @@ services:
         sync: false
       - key: HEARTBEAT_INTERVAL
         value: "30"
+      # Live door-open switch. Safe default OFF (capture-only). Flip to true in
+      # the Render dashboard ONLY to run the live scan test — it lets a granted
+      # (allow-listed) scan actually transmit IO.SetRelayState to open the door.
+      - key: GANTNER_SEND_UNLOCK
+        value: "false"

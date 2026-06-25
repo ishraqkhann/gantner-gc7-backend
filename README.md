@@ -30,7 +30,7 @@ https://api.claphouse.club/health     (health check → { "ok": true })
 | 7 | Responds to `Login` with `State: 0`, `Data: {}` |
 | 8 | Detects access/scan messages by `Cmd`/`Data` containing: `Tag`, `Barcode`, `Identification`, `Reader`, `Card`, `Access`, `CheckIn`, `FIU`, `IO.TagInReader`, `IO.InvalidTagInReader` |
 | 9 | Grants only these identifiers (temporary allow-list): `TEST123456`, `HELLO_WORLD`, `12345678` |
-| 10 | Does **not** send an unlock command yet — `placeholderUnlock()` **logs what it would send** (`App.StartUnlockProcess` grant / `App.StartDenyProcess` deny, echoing `Device`) |
+| 10 | Does **not** send an unlock command yet — `placeholderUnlock()` **logs what it would send**. Door-open is **confirmed** to be the relay command `IO.SetRelayState` `Data:{ Id, State, Device }` (`Id 1` = Entry, `2` = Exit), from the controller's own G7 web UI. A GRANT would set the Entry relay on; a DENY sends nothing. (The earlier `App.StartUnlockProcess` guess does **not** exist on this firmware.) |
 | 11 | Writes logs to `./logs/gantner-events.log` |
 | 12 | `GET /status` — live connection/heartbeat/access counters (no identifiers) |
 | 13 | `GET /recent` — last ~120 captured raw packets (newest first; `?all=1` includes heartbeats) |
@@ -287,18 +287,28 @@ node scripts/test-client.mjs ws://localhost:3000/gantner 12345678
 
 ## Next step (intentionally not done yet)
 
-The real GC7.3000 door-open / relay command is **not** confirmed, so it is only
-logged (`gantner.unlock_would_send`), never sent. The current placeholder uses
-`App.StartUnlockProcess` (a **low-confidence** guess from a reverse-engineered
-reference implementation — door grant may instead be `App.StartGrantProcess`,
-`IO.SetRelayState`, or for lockers the wire-confirmed `App.SetLockState`).
+The GC7.3000 door-open command is now **confirmed** (from the controller's own G7
+web UI bundle at `wss://<controller>/api`): the door is a **relay**, opened with
 
-Confirm the real command from the login-gated Gantner DirectConnect spec
-(`doc.gantner.com/DirectConnectDocumentation/`) or a packet capture of the
-existing `7backend2026.sevenwellness.club` session, then replace the placeholder
-in `src/gantner.ts` (the `granted` branch) and send it instead of the generic ack.
+```jsonc
+{ "Cmd": "IO.SetRelayState", "MT": "Req", "Data": { "Id": 1, "State": true, "Device": "<echo>" } }
+//  Id 1 = Entry door relay, Id 2 = Exit. Controller pulses the relay for its
+//  configured unlock time (3000 ms) and auto-resets it.
+```
 
-> Note: real scan events may also require a one-time `RegisterEvent`
-> subscription (`{"Cmd":"RegisterEvent","Data":{"Event":"App.*"}}`) right after
-> connect, and `App.PersonIdent` / `App.CardIdent` as the event `Cmd`s. These are
-> medium-confidence and should be confirmed against the live controller.
+`App.StartUnlockProcess` / `App.StartGrantProcess` / `App.StartDenyProcess` **do
+not exist** on this firmware (3.9.1 / G7 Advanced Access App v1.9.0) — that earlier
+guess was wrong. `src/gantner.ts` `placeholderUnlock()` now builds the real
+`IO.SetRelayState` frame (GRANT only; DENY sends nothing), still **logged, never
+sent**.
+
+The remaining unknown is **not the command but the channel**: confirm that the
+**External Webserver** connection (where this backend lives) actually honours an
+outbound `IO.SetRelayState` Req — the authenticated local `/api` WS clearly does
+(it's how the web UI's manual door-open button works), but the External Webserver
+channel may only receive events. Settle via packet capture or a live test on a
+**non-production** door, then flip `placeholderUnlock()` from log-only to send.
+
+> Note: `RegisterEvent` is confirmed as `{"Cmd":"RegisterEvent","Data":{"Event":"<ns>.*"}}`
+> (one namespace per request). Real scan events seen by the web UI: `IO.TagInReader`,
+> `IO.TagLost`, `IO.InvalidTagInReader`, `IO.BarcodeRead`, `FIU.Identification`.

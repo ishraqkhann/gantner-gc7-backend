@@ -204,6 +204,25 @@ wss.on('connection', (ws: WebSocket, req) => {
       ws.send(JSON.stringify(result.response));
       log('info', 'ws.message_sent', { connId, sent: result.response });
     }
+
+    // LIVE unlock: on a granted scan, transmit the IO.SetRelayState Req that
+    // opens the Entry door. Gated by GANTNER_SEND_UNLOCK (default OFF). The
+    // unlock is a server-originated Req, so it carries a fresh outbound TID.
+    if (config.sendUnlock && result.kind === 'access' && result.decision === 'GRANTED' && result.wouldSend) {
+      const unlock = { ...result.wouldSend, TID: ++outboundTid };
+      ws.send(JSON.stringify(unlock));
+      capture({
+        ts: new Date().toISOString(),
+        connId,
+        dir: 'out',
+        cmd: 'IO.SetRelayState',
+        mt: 'Req',
+        isAccess: false,
+        raw: JSON.stringify(unlock),
+        parsed: unlock,
+      });
+      log('warn', 'ws.unlock_sent', { connId, tid: unlock.TID, sent: unlock });
+    }
   });
 
   ws.on('close', (code, reason) => {

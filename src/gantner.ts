@@ -166,29 +166,48 @@ export function buildLoginResponse(msg: GantnerMessage): GantnerMessage {
 }
 
 /**
- * (10) PLACEHOLDER unlock — builds (and the caller LOGS) what we WOULD send, but
- * we transmit NOTHING. Command names (App.StartUnlockProcess grant /
- * App.StartDenyProcess deny) are corroborated by two reference backends, and the
- * event's `Device` must be echoed so the right door reacts — but the exact Data
- * shape is unconfirmed for this firmware, so nothing is sent until we confirm it
- * from the controller's own IN/OUT log.
+ * Relay map — confirmed from the controller config and the G7 web UI:
+ *   Relay 1 = reader 1 / door 1 (Entry),  Relay 2 = reader 2 / door 2 (Exit).
+ * The controller pulses the relay for its configured unlock time (3000 ms) and
+ * auto-resets it; the web UI exposes this as a relay "pulse".
  */
-export function placeholderUnlock(
+export const ENTRY_RELAY_ID = 1;
+export const EXIT_RELAY_ID = 2;
+
+/**
+ * (10) Build the door-open command for a GRANTED scan.
+ *
+ * CONFIRMED from the controller's own G7 web UI bundle (wss://<controller>/api).
+ * The web UI opens a door with:
+ *
+ *   { Cmd:"IO.SetRelayState", MT:"Req", Data:{ Id, State, Device } }
+ *
+ * Id 1 = Entry door relay, Id 2 = Exit; the controller pulses the relay for its
+ * configured unlock time (3000 ms) and auto-resets it. There is NO command named
+ * `App.StartUnlockProcess` / `App.StartDenyProcess` anywhere in this firmware
+ * (3.9.1 / G7 Advanced Access App v1.9.0) — that earlier reverse-engineered guess
+ * was WRONG. The door is a relay.
+ *
+ *   GRANTED → set the Entry relay on (controller pulses + auto-resets).
+ *   DENIED  → null; nothing is sent, the door simply isn't opened. (Negative
+ *             reader feedback would be IO.SetStatusLED {ColorOn} / IO.PlaySound,
+ *             but the ColorOn value isn't confirmed, so we don't fabricate one.)
+ *
+ * Whether this is actually transmitted is gated by `config.sendUnlock` in the
+ * caller — default OFF (capture-only). The STILL-OPEN question is whether the
+ * External Webserver channel honours an outbound IO.SetRelayState Req the same
+ * way the authenticated local /api WS does; the live scan test settles it.
+ */
+export function buildUnlock(
   msg: GantnerMessage,
   decision: 'GRANTED' | 'DENIED',
-): GantnerMessage {
+): GantnerMessage | null {
+  if (decision !== 'GRANTED') return null;
   const device = (msg.Data as Record<string, unknown> | undefined)?.Device ?? null;
-  if (decision === 'GRANTED') {
-    return {
-      Cmd: 'App.StartUnlockProcess',
-      MT: 'Req',
-      Data: { DisplayText: 'Welcome', Device: device, Note: 'PLACEHOLDER grant — NOT sent' },
-    };
-  }
   return {
-    Cmd: 'App.StartDenyProcess',
+    Cmd: 'IO.SetRelayState',
     MT: 'Req',
-    Data: { DisplayText: 'Access denied', Device: device, Note: 'PLACEHOLDER deny — NOT sent' },
+    Data: { Id: ENTRY_RELAY_ID, State: true, Device: device },
   };
 }
 
@@ -210,8 +229,8 @@ export function buildAck(msg: GantnerMessage): GantnerMessage {
 export interface HandleResult {
   /** Message to send back to the controller, or null to stay silent. */
   response: GantnerMessage | null;
-  /** The unlock command we WOULD have sent (logged only, never sent yet). */
-  wouldSend?: GantnerMessage;
+  /** The unlock command we WOULD have sent (logged only, never sent yet). Null on DENIED. */
+  wouldSend?: GantnerMessage | null;
   /** Classification for stats/monitoring. */
   kind?: 'heartbeat' | 'login' | 'access' | 'rsp' | 'other';
   /** Access decision, when kind === 'access'. */
@@ -277,17 +296,22 @@ export function handleMessage(msg: GantnerMessage): HandleResult {
       });
     }
 
-    // (10) Placeholder unlock — LOG what we would send; transmit nothing.
+    // (10) Build the unlock for a GRANT. Whether it's actually transmitted is
+    // decided by config.sendUnlock in the caller (index.ts).
     const decision: 'GRANTED' | 'DENIED' = granted ? 'GRANTED' : 'DENIED';
-    const wouldSend = placeholderUnlock(msg, decision);
-    log('warn', 'gantner.unlock_would_send', {
+    const wouldSend = buildUnlock(msg, decision);
+    log(config.sendUnlock ? 'info' : 'warn', 'gantner.unlock', {
       decision,
       identifier: matched ?? null,
-      note: 'Capture phase — nothing sent to controller. This is what we WOULD send.',
+      willSend: config.sendUnlock && Boolean(wouldSend),
+      note: !wouldSend
+        ? 'DENIED — no door command.'
+        : config.sendUnlock
+          ? 'LIVE — transmitting IO.SetRelayState to open the Entry door.'
+          : 'CAPTURE — not sent (set GANTNER_SEND_UNLOCK=true to go live).',
       wouldSend,
     });
 
-    // Capture phase: LOG access events; do NOT respond to scans yet.
     return { response: null, wouldSend, kind: 'access', decision };
   }
 

@@ -25,4 +25,14 @@ export const config = {
    */
   registerEvents: (process.env.GANTNER_REGISTER_EVENTS ?? 'true').toLowerCase() === 'true',
   registerEventFilter: process.env.GANTNER_REGISTER_FILTER ?? '*',
+
+  /**
+   * LIVE DECISION SWITCH. When false (default), an access GRANT only LOGS the
+   * unlock it WOULD send (safe capture phase). When true, the backend actually
+   * transmits `IO.SetRelayState {Id:1,State:true}` to open the Entry door on a
+   * granted scan. Only allow-listed identifiers ever grant, so flipping this on
+   * can at most OPEN a door for a known test QR — it can never lock anyone out.
+   * Flip on (GANTNER_SEND_UNLOCK=true) only to run the live end-to-end test.
+   */
+  sendUnlock: (process.env.GANTNER_SEND_UNLOCK ?? 'false').toLowerCase() === 'true',
 };

@@ -75,7 +75,28 @@ Key files: `src/index.ts` (server/WS/routing/subscriptions), `src/gantner.ts`
 ## Confirmed protocol facts
 
 Envelope: `{ "Cmd":string, "MT":"Req"|"Rsp"|"Evt", "TID":number, "Data":object }`,
-`State` is a **sibling** of `Data` on responses (0 = OK).
+`State` is a **sibling** of `Data` on responses (0 = OK). (Confirmed verbatim from
+the web UI's base message class: `{Cmd, TID, MT, Data, State}`.)
+
+**Local control plane (NEW, 2026-06-25, read-only):** the G7 web UI drives each
+controller over **`wss://<controller-ip>/api`** — e.g. `wss://10.20.20.35/api`.
+It's **login-gated** (`Login` + an `AuthorizationError` flow); all events mirror
+to that socket. The controllers expose **only 80/443** (web UI) — no `:8241`
+(Relaxx) / SSH / telnet, so the **Path B management server is NOT on the
+controllers** (separate host if it exists; not yet located). `.35/.38/.39` up,
+`.36` no ICMP.
+
+**Door-open / relay (NEW, 2026-06-25, CONFIRMED from the web UI bundle):**
+- Open a door: `{ "Cmd":"IO.SetRelayState", "MT":"Req", "Data":{ "Id":1, "State":true, "Device":<echo> } }`
+  (`Id 1` = Entry, `2` = Exit; controller pulses for the 3000 ms unlock time, auto-resets).
+- Reader feedback: `IO.SetStatusLED {ColorOn}`, `IO.PlaySound`, `IO.SetBarcodereaderFeedback`.
+- Lockers (separate): `Addon.SetLockState`, `Addon.LockRequest`, `Addon.OpenAllLocks`.
+- `RegisterEvent {Event}` / `UnregisterEvent {Event}` confirmed (matches this backend).
+- **Channel caveat — the one thing still unproven:** the local `/api` WS clearly
+  honours `IO.SetRelayState` Req (it's the UI's manual door-open). Whether the
+  **External Webserver** channel (where THIS backend connects) also honours an
+  outbound `IO.SetRelayState` Req is **NOT** yet confirmed — settle by capture or a
+  test on a non-production door before `placeholderUnlock()` is ever flipped to send.
 
 **Observed commands** (controller↔backends / browser UI): Heartbeat, Login,
 GetDeviceInfo, RegisterEvent, Config.ReadSchema, IO.GetOptoState, IO.GetRelayState,
@@ -168,9 +189,13 @@ chat or commit them).
 2. **The old `7backend2026.sevenwellness.club` code or a packet capture** of a real
    entry — settles whether the External Webserver ever decided access, and the real
    unlock command.
-3. **The real door-grant/relay command + Data schema** for G7 Advanced Access App on
-   fw 3.9.1 (candidates: `App.StartUnlockProcess`, `IO.SetRelayState`,
-   `App.SetLockState` for lockers) — from Gantner or a capture.
+3. ~~**The real door-grant/relay command + Data schema**~~ **— RESOLVED (2026-06-25,
+   read-only from the controller's own G7 web UI bundle).** Door-open is the relay
+   command `IO.SetRelayState` `Data:{ Id, State, Device }` (`Id 1` = Entry relay,
+   `2` = Exit; controller pulses it for the 3000 ms unlock time and auto-resets).
+   `App.StartUnlockProcess` / `App.SetLockState`-for-doors **do not exist** on fw
+   3.9.1. (Lockers use `Addon.SetLockState` / `Addon.LockRequest`.) Remaining
+   unknown is the **channel**, not the command — see "Confirmed protocol facts".
 4. **The QR Challenge anti-forgery secret/algorithm** (`GANTNER#<Id>#<Timestamp>#<Challenge>`)
    — needed before any QR grant can be trusted; currently unvalidated.
 
