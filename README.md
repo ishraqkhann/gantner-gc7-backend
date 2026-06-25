@@ -1,5 +1,7 @@
 # Gantner GC7.3000 — Production WebSocket Backend
 
+> 🤖 **Running Claude Code on the gym PC?** Read **[ONSITE-CLAUDE-BRIEF.md](ONSITE-CLAUDE-BRIEF.md)** first — it's the full context + on-site test plan.
+
 Express + WebSocket backend (Node.js + TypeScript) for **Gantner GC7.3000** access
 controllers using the **External Webserver** JSON protocol.
 
