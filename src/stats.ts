@@ -15,6 +15,10 @@ export interface ConnInfo {
   messages: number;
   authPresent: boolean;
   lastCmd?: string;
+  /** Controller identity, resolved from GetDeviceInfo on connect. */
+  serial?: string;
+  gateName?: string;
+  direction?: 'entry' | 'exit';
 }
 
 export const serverStartedAt = new Date().toISOString();

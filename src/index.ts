@@ -6,8 +6,9 @@ import { URL } from 'url';
 
 import { config } from './config';
 import { log, LOG_FILE_PATH } from './logger';
-import { GantnerMessage, handleMessage } from './gantner';
+import { GantnerMessage, handleMessage, collectStringValues } from './gantner';
 import { connections, totals, lastSeen, statusSnapshot, capture, recentMessages } from './stats';
+import { Gate, gateForSerial, gatesInDirection, serialFromValues } from './topology';
 
 const WS_PATH = '/gantner';
 
@@ -58,9 +59,55 @@ let connectionSeq = 0;
 let outboundTid = 9000; // TID for server-originated requests (e.g. RegisterEvent)
 
 // A single physical scan emits BOTH IO.BarcodeRead and IO.TagInReader (often
-// repeated). Collapse them to one relay pulse per door within this window.
+// repeated). Collapse them to one relay pulse per (target connection + relay)
+// within this window. Keyed "<connId>:<relay>" so a group-open that pulses the
+// same relay number on two different controllers is NOT deduped against itself.
 const UNLOCK_DEDUP_MS = 3000;
-const lastUnlockByRelay = new Map<number, number>();
+const lastUnlockByRelay = new Map<string, number>();
+
+// Live connection registry: connId -> { ws, identity }. Lets a scan on one
+// controller push IO.SetRelayState down OTHER controllers' connections (the
+// by-direction group). Identity is resolved from GetDeviceInfo on connect.
+interface LiveConn {
+  ws: WebSocket;
+  serial?: string;
+  gate?: Gate | null;
+}
+const liveConns = new Map<number, LiveConn>();
+
+interface UnlockTarget {
+  connId: number;
+  ws: WebSocket;
+  relay: number;
+  label: string;
+}
+
+/**
+ * Which barriers to open for a granted scan on `scanConnId`. If we've identified
+ * the scanning controller, open the door relay on every connected controller in
+ * the SAME direction (entry/exit) — that's the by-direction group. If it isn't
+ * identified yet (GetDeviceInfo still in flight, or unknown serial), fall back to
+ * opening just the scanning controller using the reader-derived relay.
+ */
+function unlockTargets(scanConnId: number, fallback: GantnerMessage | null): UnlockTarget[] {
+  const me = liveConns.get(scanConnId);
+  const out: UnlockTarget[] = [];
+  if (me?.gate) {
+    for (const g of gatesInDirection(me.gate.direction)) {
+      for (const [cid, lc] of liveConns) {
+        if (lc.serial === g.serial && lc.ws.readyState === WebSocket.OPEN) {
+          out.push({ connId: cid, ws: lc.ws, relay: g.doorRelay, label: g.name });
+        }
+      }
+    }
+    if (out.length) return out;
+  }
+  if (me) {
+    const r = fallback ? Number((fallback.Data as Record<string, unknown>)?.Id) : 1;
+    out.push({ connId: scanConnId, ws: me.ws, relay: Number.isFinite(r) ? r : 1, label: 'unidentified-self' });
+  }
+  return out;
+}
 
 // CONFIRMED from probing the live controller: RegisterEvent accepts
 // Data:{Event:'<namespace>.*'} — a single Event field with ONE namespace
@@ -125,8 +172,21 @@ wss.on('connection', (ws: WebSocket, req) => {
     authPresent,
   });
 
+  liveConns.set(connId, { ws });
+
   // (2) Log connection IP + headers (Authorization redacted to its length).
   log('info', 'ws.connected', { connId, remote, clientIp, tokenFp, headers: redactHeaders(req.headers), authPresent });
+
+  // Identify which physical controller this is (entry/exit + serial) so a scan
+  // here can open the whole direction group. The GetDeviceInfo Rsp carries the
+  // serial; we match it against the known gates in topology.ts.
+  {
+    const tid = ++outboundTid;
+    const frame = { Cmd: 'GetDeviceInfo', MT: 'Req', TID: tid, Data: {} };
+    ws.send(JSON.stringify(frame));
+    capture({ ts: new Date().toISOString(), connId, dir: 'out', cmd: 'GetDeviceInfo', mt: 'Req', isAccess: false, raw: JSON.stringify(frame), parsed: frame });
+    log('info', 'ws.get_device_info_sent', { connId, tid });
+  }
 
   // Optional: ask the controller to push events. OFF by default (capture phase);
   // flip GANTNER_REGISTER_EVENTS=true only if scans don't arrive on their own.
@@ -165,6 +225,31 @@ wss.on('connection', (ws: WebSocket, req) => {
 
     // (5) ...then the parsed form.
     log('info', 'ws.message_parsed', { connId, parsed: msg });
+
+    // Controller identification: the GetDeviceInfo response carries the serial.
+    // Match it to a known gate so scans here open the right direction group.
+    if (msg.Cmd === 'GetDeviceInfo' && msg.MT === 'Rsp') {
+      const serial = serialFromValues(collectStringValues(msg.Data ?? {}));
+      const gate = gateForSerial(serial ?? undefined);
+      const lc = liveConns.get(connId);
+      if (lc) {
+        lc.serial = serial ?? undefined;
+        lc.gate = gate;
+      }
+      const ci = connections.get(connId);
+      if (ci) {
+        ci.serial = serial ?? undefined;
+        ci.gateName = gate?.name;
+        ci.direction = gate?.direction;
+      }
+      log(gate ? 'info' : 'warn', 'ws.identified', {
+        connId,
+        serial: serial ?? null,
+        gate: gate?.name ?? null,
+        direction: gate?.direction ?? null,
+        note: gate ? undefined : 'serial not in known gate list — group-open will fall back to this controller only',
+      });
+    }
 
     const result = handleMessage(msg);
 
@@ -210,36 +295,30 @@ wss.on('connection', (ws: WebSocket, req) => {
       log('info', 'ws.message_sent', { connId, sent: result.response });
     }
 
-    // LIVE unlock: on a granted scan, transmit the IO.SetRelayState Req that
-    // opens the Entry door. Gated by GANTNER_SEND_UNLOCK (default OFF). The
-    // unlock is a server-originated Req, so it carries a fresh outbound TID.
-    if (config.sendUnlock && result.kind === 'access' && result.decision === 'GRANTED' && result.wouldSend) {
-      const relayId = Number((result.wouldSend.Data as Record<string, unknown>)?.Id);
+    // LIVE unlock: on a granted scan, open BOTH barriers in the scanning
+    // controller's DIRECTION (entry or exit). Gated by GANTNER_SEND_UNLOCK.
+    if (config.sendUnlock && result.kind === 'access' && result.decision === 'GRANTED') {
+      const targets = unlockTargets(connId, result.wouldSend ?? null);
       const now = Date.now();
-      const prev = lastUnlockByRelay.get(relayId) ?? 0;
-      if (now - prev < UNLOCK_DEDUP_MS) {
-        log('info', 'ws.unlock_skipped_dedup', { connId, relayId, sinceMs: now - prev });
-      } else {
-        lastUnlockByRelay.set(relayId, now);
-        const unlock = { ...result.wouldSend, TID: ++outboundTid };
-        ws.send(JSON.stringify(unlock));
-        capture({
-          ts: new Date().toISOString(),
-          connId,
-          dir: 'out',
-          cmd: 'IO.SetRelayState',
-          mt: 'Req',
-          isAccess: false,
-          raw: JSON.stringify(unlock),
-          parsed: unlock,
-        });
-        log('warn', 'ws.unlock_sent', { connId, tid: unlock.TID, relayId, sent: unlock });
+      for (const t of targets) {
+        const key = `${t.connId}:${t.relay}`;
+        const prev = lastUnlockByRelay.get(key) ?? 0;
+        if (now - prev < UNLOCK_DEDUP_MS) {
+          log('info', 'ws.unlock_skipped_dedup', { fromConn: connId, target: t.label, relay: t.relay, sinceMs: now - prev });
+          continue;
+        }
+        lastUnlockByRelay.set(key, now);
+        const unlock = { Cmd: 'IO.SetRelayState', MT: 'Req', Data: { Id: t.relay, State: true }, TID: ++outboundTid };
+        t.ws.send(JSON.stringify(unlock));
+        capture({ ts: new Date().toISOString(), connId: t.connId, dir: 'out', cmd: 'IO.SetRelayState', mt: 'Req', isAccess: false, raw: JSON.stringify(unlock), parsed: unlock });
+        log('warn', 'ws.unlock_sent', { fromConn: connId, targetConn: t.connId, gate: t.label, relay: t.relay, tid: unlock.TID });
       }
     }
   });
 
   ws.on('close', (code, reason) => {
     connections.delete(connId);
+    liveConns.delete(connId);
     log('info', 'ws.closed', { connId, code, reason: reason.toString() });
   });
 
