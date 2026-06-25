@@ -35,4 +35,12 @@ export const config = {
    * Flip on (GANTNER_SEND_UNLOCK=true) only to run the live end-to-end test.
    */
   sendUnlock: (process.env.GANTNER_SEND_UNLOCK ?? 'false').toLowerCase() === 'true',
+
+  /**
+   * How long (ms) a door relay stays energized before the backend sends
+   * State:false to close it. IO.SetRelayState{State:true} LATCHES on this
+   * firmware (it does not auto-reset), so we must close it ourselves — otherwise
+   * the barrier stays open. Matches the controller's 3000 ms unlock time.
+   */
+  unlockPulseMs: parseInt(process.env.GANTNER_UNLOCK_PULSE_MS ?? '3000', 10),
 };

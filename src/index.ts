@@ -109,6 +109,23 @@ function unlockTargets(scanConnId: number, fallback: GantnerMessage | null): Unl
   return out;
 }
 
+/** Send a raw IO.SetRelayState to one connection. */
+function sendRelay(ws: WebSocket, connId: number, relayId: number, state: boolean): void {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const frame = { Cmd: 'IO.SetRelayState', MT: 'Req', Data: { Id: relayId, State: state }, TID: ++outboundTid };
+  ws.send(JSON.stringify(frame));
+  capture({ ts: new Date().toISOString(), connId, dir: 'out', cmd: 'IO.SetRelayState', mt: 'Req', isAccess: false, raw: JSON.stringify(frame), parsed: frame });
+}
+
+/** After the unlock time, close the relay so the barrier doesn't latch open. */
+function scheduleRelayClose(ws: WebSocket, connId: number, relayId: number, label: string): void {
+  setTimeout(() => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    sendRelay(ws, connId, relayId, false);
+    log('info', 'ws.relay_auto_close', { targetConn: connId, gate: label, relay: relayId });
+  }, config.unlockPulseMs);
+}
+
 // CONFIRMED from probing the live controller: RegisterEvent accepts
 // Data:{Event:'<namespace>.*'} — a single Event field with ONE namespace
 // wildcard. {Event:'IO.*'} returned State:0; '*', arrays, {}, Filter/Mask/Name
@@ -312,6 +329,9 @@ wss.on('connection', (ws: WebSocket, req) => {
         t.ws.send(JSON.stringify(unlock));
         capture({ ts: new Date().toISOString(), connId: t.connId, dir: 'out', cmd: 'IO.SetRelayState', mt: 'Req', isAccess: false, raw: JSON.stringify(unlock), parsed: unlock });
         log('warn', 'ws.unlock_sent', { fromConn: connId, targetConn: t.connId, gate: t.label, relay: t.relay, tid: unlock.TID });
+        // PULSE: close the relay after the unlock time so the barrier doesn't
+        // latch open. State:true latches on this firmware — we must reset it.
+        scheduleRelayClose(t.ws, t.connId, t.relay, t.label);
       }
     }
   });
@@ -325,6 +345,42 @@ wss.on('connection', (ws: WebSocket, req) => {
   ws.on('error', (err) => {
     log('error', 'ws.error', { connId, error: err.message });
   });
+});
+
+// RECOVERY: force-close door relays on every connected controller. Use to clear
+// barriers that got latched open. Closes relays 1 & 2 (the door relays in play)
+// on all connections, or a specific relay via ?id=N.
+app.get('/relay/close-all', (req, res) => {
+  const only = req.query.id ? [parseInt(String(req.query.id), 10)] : [1, 2];
+  let sent = 0;
+  const targets: Array<{ connId: number; gate: string; relays: number[] }> = [];
+  for (const [cid, lc] of liveConns) {
+    if (lc.ws.readyState !== WebSocket.OPEN) continue;
+    for (const relayId of only) {
+      sendRelay(lc.ws, cid, relayId, false);
+      sent += 1;
+    }
+    targets.push({ connId: cid, gate: lc.gate?.name ?? '(unidentified)', relays: only });
+  }
+  log('warn', 'http.relay_close_all', { sent, relays: only, targets });
+  res.json({ ok: true, closed: sent, relays: only, targets });
+});
+
+// COMMISSIONING: manually pulse one relay on one connection, to map which relay
+// opens which physical door. e.g. /relay/pulse?conn=1&id=2
+// (NOTE: no auth — commissioning tool. Protect or remove before production.)
+app.get('/relay/pulse', (req, res) => {
+  const cid = parseInt(String(req.query.conn), 10);
+  const id = parseInt(String(req.query.id), 10);
+  const lc = liveConns.get(cid);
+  if (!lc || lc.ws.readyState !== WebSocket.OPEN) {
+    return res.status(404).json({ ok: false, error: 'connection not found / not open', conn: cid });
+  }
+  if (!Number.isFinite(id)) return res.status(400).json({ ok: false, error: 'id (relay number) required' });
+  sendRelay(lc.ws, cid, id, true);
+  scheduleRelayClose(lc.ws, cid, id, lc.gate?.name ?? `conn${cid}`);
+  log('warn', 'http.relay_pulse', { conn: cid, relay: id, gate: lc.gate?.name ?? null });
+  res.json({ ok: true, pulsed: { conn: cid, gate: lc.gate?.name ?? null, relay: id, closeAfterMs: config.unlockPulseMs } });
 });
 
 /* ----------------------------- boot ------------------------------ */
