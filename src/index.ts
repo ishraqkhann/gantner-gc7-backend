@@ -8,7 +8,7 @@ import { config } from './config';
 import { log, LOG_FILE_PATH } from './logger';
 import { GantnerMessage, handleMessage, collectStringValues } from './gantner';
 import { connections, totals, lastSeen, statusSnapshot, capture, recentMessages } from './stats';
-import { Gate, gateForSerial, gatesInDirection, serialFromValues } from './topology';
+import { Gate, gateForSerial, gatesInDoor, serialFromValues } from './topology';
 
 const WS_PATH = '/gantner';
 
@@ -93,7 +93,7 @@ function unlockTargets(scanConnId: number, fallback: GantnerMessage | null): Unl
   const me = liveConns.get(scanConnId);
   const out: UnlockTarget[] = [];
   if (me?.gate) {
-    for (const g of gatesInDirection(me.gate.direction)) {
+    for (const g of gatesInDoor(me.gate.door)) {
       for (const [cid, lc] of liveConns) {
         if (lc.serial === g.serial && lc.ws.readyState === WebSocket.OPEN) {
           out.push({ connId: cid, ws: lc.ws, relay: g.doorRelay, label: g.name });
@@ -257,13 +257,15 @@ wss.on('connection', (ws: WebSocket, req) => {
       if (ci) {
         ci.serial = serial ?? undefined;
         ci.gateName = gate?.name;
-        ci.direction = gate?.direction;
+        ci.door = gate?.door;
+        ci.side = gate?.side;
       }
       log(gate ? 'info' : 'warn', 'ws.identified', {
         connId,
         serial: serial ?? null,
         gate: gate?.name ?? null,
-        direction: gate?.direction ?? null,
+        door: gate?.door ?? null,
+        side: gate?.side ?? null,
         note: gate ? undefined : 'serial not in known gate list — group-open will fall back to this controller only',
       });
     }

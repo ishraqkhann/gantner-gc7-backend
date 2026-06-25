@@ -18,7 +18,8 @@ export interface ConnInfo {
   /** Controller identity, resolved from GetDeviceInfo on connect. */
   serial?: string;
   gateName?: string;
-  direction?: 'entry' | 'exit';
+  door?: 1 | 2;
+  side?: 'L' | 'R';
 }
 
 export const serverStartedAt = new Date().toISOString();
