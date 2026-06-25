@@ -19,13 +19,14 @@ export interface Gate {
   doorRelay: number;
 }
 
-// doorRelay = 1 per the site wiring (commissioning). NOTE: the first live test
-// opened Relay 2 (the scan came in on reader 2); if a barrier doesn't move,
-// flip the relevant doorRelay to 2 here — single source of truth.
+// doorRelay mapped per gate by live pulse testing (2026-06-25): "Left" gates are
+// wired to Relay 1, "Right" gates to Relay 2. R4/R3/R1 confirmed by pulse;
+// R2_Exit_Left predicted from the pattern (it was off the network during
+// mapping) — verify with /relay/pulse once it reconnects.
 export const GATES: Record<string, Gate> = {
   '2326030171': { serial: '2326030171', name: 'R4_Entry_Left', direction: 'entry', doorRelay: 1 },
-  '2326030447': { serial: '2326030447', name: 'R3_Entry_Right', direction: 'entry', doorRelay: 1 },
-  '2417030243': { serial: '2417030243', name: 'R1_Exit_Right', direction: 'exit', doorRelay: 1 },
+  '2326030447': { serial: '2326030447', name: 'R3_Entry_Right', direction: 'entry', doorRelay: 2 },
+  '2417030243': { serial: '2417030243', name: 'R1_Exit_Right', direction: 'exit', doorRelay: 2 },
   '2326030167': { serial: '2326030167', name: 'R2_Exit_Left', direction: 'exit', doorRelay: 1 },
 };
 
