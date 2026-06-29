@@ -17,7 +17,7 @@ network, then continue.
 ## UPDATE 2026-06-29 — Clap House is now wired (decision flow implemented)
 
 The backend no longer uses a local allow-list. It now **forwards each scanned QR
-token to Clap House** (`POST https://app.claphouse.co/api/access/validate`) and
+token to Clap House** (`POST https://claphouse.co/api/access/validate`) and
 opens the gate only on `{ result: "granted" }` — see [README.md](README.md)
 "Access decision". This answers open question #4 (the QR anti-forgery secret):
 **Clap House** verifies the signature/expiry/single-use, so we forward the token

@@ -591,8 +591,8 @@ app.get('/relay/pulse', (req, res) => {
     if (u.protocol !== 'https:' && !localish) {
       log('warn', 'config.insecure_validate_url', { url: config.claphouseValidateUrl, note: 'not https — tokens would be forwarded in cleartext' });
     }
-    if (u.hostname !== 'app.claphouse.co' && !localish) {
-      log('warn', 'config.unexpected_validate_host', { host: u.hostname, note: 'access decision host is not app.claphouse.co' });
+    if (u.hostname !== 'claphouse.co' && !localish) {
+      log('warn', 'config.unexpected_validate_host', { host: u.hostname, note: 'access decision host is not claphouse.co' });
     }
   } catch {
     log('error', 'config.bad_validate_url', { url: config.claphouseValidateUrl, note: 'unparseable — every scan will FAIL CLOSED (deny)' });

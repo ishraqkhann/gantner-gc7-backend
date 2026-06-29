@@ -45,7 +45,7 @@ export const config = {
   unlockPulseMs: parseInt(process.env.GANTNER_UNLOCK_PULSE_MS ?? '3000', 10),
 
   /* ----------------------------- Clap House ------------------------------ *
-   * Clap House (https://app.claphouse.co) is the SOURCE OF TRUTH for access.
+   * Clap House (https://claphouse.co) is the SOURCE OF TRUTH for access.
    * On every scan we forward the raw QR token to its validate endpoint and only
    * open the gate when it replies { result: "granted" }. We never parse or trust
    * the token ourselves — Clap House verifies signature/expiry/single-use/hours.
@@ -53,7 +53,7 @@ export const config = {
 
   /** Clap House access-decision endpoint. POST { token, gateId } → { result }. */
   claphouseValidateUrl:
-    process.env.CLAPHOUSE_VALIDATE_URL ?? 'https://app.claphouse.co/api/access/validate',
+    process.env.CLAPHOUSE_VALIDATE_URL ?? 'https://claphouse.co/api/access/validate',
 
   /**
    * Shared gate key sent as the `x-gate-key` header. Empty = not yet set (the

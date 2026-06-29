@@ -12,7 +12,7 @@ wss://gantner-gc7-backend.onrender.com/gantner   (WebSocket — GC7 connects her
 https://gantner-gc7-backend.onrender.com/health  (health check → { "ok": true })
 ```
 
-Decisions are delegated to **Clap House** (`https://app.claphouse.co`), the source
+Decisions are delegated to **Clap House** (`https://claphouse.co`), the source
 of truth for access.
 
 > Replaces the controller's current External Webserver target
@@ -153,7 +153,7 @@ curl http://localhost:3000/health      # {"ok":true}
 | `PORT` | `3000` | Railway/Render inject their own — don't hardcode in prod. |
 | `GANTNER_ACCESS_TOKEN` | _(empty)_ | Shared secret the GC7 sends in the `Authorization` header on the WS upgrade. Empty = not enforced. |
 | `HEARTBEAT_INTERVAL` | `30` | `HBI` value advertised back to the controller. |
-| `CLAPHOUSE_VALIDATE_URL` | `https://app.claphouse.co/api/access/validate` | Clap House access-decision endpoint. |
+| `CLAPHOUSE_VALIDATE_URL` | `https://claphouse.co/api/access/validate` | Clap House access-decision endpoint. |
 | `GATE_API_KEY` | _(empty)_ | Sent as `x-gate-key`. Set the **same** value here and in Clap House's Vercel env at the same time (Clap House auto-enforces once set). |
 | `CLAPHOUSE_TIMEOUT_MS` | `5000` | Validate-call timeout. On timeout → **deny** (fail closed). |
 | `GANTNER_SEND_UNLOCK` | `false` | `false` = shadow mode (validate + record, don't open). `true` = open the gate on a Clap-House grant. |

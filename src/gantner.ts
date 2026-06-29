@@ -359,7 +359,7 @@ export function handleMessage(msg: GantnerMessage): HandleResult {
   }
 
   // (8) Access / scan / identification. The DECISION is no longer made here —
-  // Clap House (https://app.claphouse.co) is the source of truth. We only pull
+  // Clap House (https://claphouse.co) is the source of truth. We only pull
   // out the raw scanned token and the candidate relay frame; index.ts then calls
   // validateWithClapHouse() and pulses the relay on a grant. Forward the token
   // VERBATIM — never parse, cache, or second-guess it.
