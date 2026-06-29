@@ -71,6 +71,48 @@ export function capture(m: CapturedMessage): void {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * Access decision feed (for GET /recent — read live by the Clap House admin)
+ * ------------------------------------------------------------------ *
+ * One entry per access decision. Contains NO raw token / NO PII — only gate,
+ * decision and denial reason. Field names are doubled (decision+result,
+ * gateName+gate) because the Clap House reader is defensive about field names.
+ */
+export interface AccessDecision {
+  at: string; // ISO timestamp of the decision
+  gateName: string;
+  gate: string; // alias of gateName
+  serial?: string;
+  decision: 'granted' | 'denied';
+  result: 'granted' | 'denied'; // alias of decision
+  denialReason?: string;
+}
+
+const MAX_DECISIONS = 120;
+export const recentDecisions: AccessDecision[] = [];
+
+export function recordDecision(d: {
+  at: string;
+  gateName: string;
+  serial?: string;
+  decision: 'granted' | 'denied';
+  denialReason?: string;
+}): void {
+  const entry: AccessDecision = {
+    at: d.at,
+    gateName: d.gateName,
+    gate: d.gateName,
+    serial: d.serial,
+    decision: d.decision,
+    result: d.decision,
+    denialReason: d.denialReason,
+  };
+  recentDecisions.push(entry);
+  if (recentDecisions.length > MAX_DECISIONS) {
+    recentDecisions.splice(0, recentDecisions.length - MAX_DECISIONS);
+  }
+}
+
 export function statusSnapshot() {
   const now = Date.now();
   return {
@@ -78,9 +120,21 @@ export function statusSnapshot() {
     service: 'gantner-gc7-backend',
     startedAt: serverStartedAt,
     activeConnections: connections.size,
+    // Whitelist only the fields the Clap House admin needs. Deliberately OMIT
+    // clientIp / remote / tokenFp — this endpoint is unauthenticated, and the
+    // site's public IP + controller auth-token fingerprints are recon material.
     connections: [...connections.values()].map((c) => ({
-      ...c,
+      connId: c.connId,
+      serial: c.serial,
+      gateName: c.gateName,
+      door: c.door,
+      side: c.side,
+      connectedAt: c.connectedAt,
+      lastSeen: c.lastSeen,
       idleSeconds: Math.round((now - Date.parse(c.lastSeen)) / 1000),
+      messages: c.messages,
+      lastCmd: c.lastCmd,
+      authPresent: c.authPresent,
     })),
     totals,
     lastSeen,

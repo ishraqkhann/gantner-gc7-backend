@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { config } from './config';
 import { log } from './logger';
 
@@ -35,13 +36,10 @@ export const ACCESS_KEYS = [
   'CheckIn',
 ] as const;
 
-/**
- * TEMPORARY allow-list. Only these identifiers are treated as "access granted"
- * during commissioning. Scoped to TEST123456 only per current requirement
- * ("for now only open with the TEST123456 QR"). Add more codes here, or replace
- * with a real membership lookup, before going live.
- */
-export const ALLOWED_IDENTIFIERS = new Set<string>(['TEST123456']);
+// NOTE: there is deliberately NO local allow-list. Access is decided ONLY by
+// Clap House via validateWithClapHouse() — the backend forwards the scanned token
+// and obeys the verdict. (The old TEST123456 commissioning allow-list was removed
+// when Clap House became the source of truth.)
 
 const nowIso = (): string => new Date().toISOString();
 
@@ -67,56 +65,188 @@ export function isAccessMessage(msg: GantnerMessage): boolean {
   return ACCESS_KEYS.some((k) => k in data) || ACCESS_KEYS.some((k) => k in msg);
 }
 
-/** Pull every plausible identifier value out of an access message. */
-export function extractIdentifiers(msg: GantnerMessage): string[] {
-  const out: string[] = [];
-  const sources: Record<string, unknown>[] = [msg.Data ?? {}, msg as Record<string, unknown>];
+/**
+ * Reader/device label noise that turns up as string leaves in scan events but is
+ * NEVER the scanned token (e.g. "READER1", "BARCODE2", "BARCODE_DATA", "UNKNOWN").
+ * Used by extractScanToken's fallback so we never forward a device name as the QR.
+ */
+const TOKEN_NOISE = /^(READER\d*|BARCODE\d*|BARCODE_DATA|UNKNOWN|TAG|CARD)$/i;
 
-  for (const src of sources) {
-    for (const key of ACCESS_KEYS) {
-      const v = src[key];
-      if (typeof v === 'string' && v.trim()) out.push(v.trim());
-      else if (typeof v === 'number') out.push(String(v));
-    }
+/** Direct fields that may carry the scanned token (in Data or at the top level). */
+const TOKEN_FIELDS = ['Barcode', 'Tag', 'Identification', 'Card'] as const;
+
+/**
+ * Extract the ONE raw scanned string to forward to Clap House as `token`.
+ *
+ * Clap House is the source of truth and treats the token as opaque (it's a
+ * short-lived signed JWT) — so we forward the scan VERBATIM and never parse it.
+ * We only need to pick the right leaf out of the GC7 scan envelope:
+ *
+ *   IO.BarcodeRead     → Data.Barcode
+ *   IO.TagInReader     → Data.Tag  | Data.Segments[].Data (SegmentType BARCODE_DATA)
+ *   FIU.Identification → Data.Identification
+ *
+ * Falls back to the longest non-noise string anywhere in Data (a JWT is long and
+ * contains dots, so it wins) — covers QR-mode=API framings we haven't seen yet.
+ * Returns null when there's nothing scannable (e.g. IO.InvalidTagInReader).
+ */
+export function extractScanToken(msg: GantnerMessage): string | null {
+  const d = (msg.Data ?? {}) as Record<string, unknown>;
+
+  // 1) Known direct fields, in priority order — in Data, then at the top level
+  //    (isAccessMessage accepts a token in either place, so extraction must too).
+  for (const key of TOKEN_FIELDS) {
+    const v = d[key];
+    if (typeof v === 'string' && v.trim()) return v.trim();
   }
-  // de-dupe while preserving order
-  return [...new Set(out)];
+  for (const key of TOKEN_FIELDS) {
+    const v = (msg as Record<string, unknown>)[key];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+
+  // 2) IO.TagInReader rich form: Segments[].Data (prefer BARCODE_DATA).
+  if (Array.isArray(d.Segments)) {
+    const segs = d.Segments as Array<Record<string, unknown>>;
+    const barcodeSeg = segs.find(
+      (s) => typeof s?.Data === 'string' && (s as { Data: string }).Data.trim() &&
+        String(s?.SegmentType ?? '').toUpperCase().includes('BARCODE'),
+    );
+    const anySeg = segs.find((s) => typeof s?.Data === 'string' && (s as { Data: string }).Data.trim());
+    const seg = (barcodeSeg ?? anySeg) as { Data?: string } | undefined;
+    if (seg?.Data) return seg.Data.trim();
+  }
+
+  // 3) Fallback: the longest non-noise, non-numeric string leaf in Data. A JWT
+  //    token (header.payload.signature) is far longer than any reader/device
+  //    label, and prefer one that is JWT-shaped (two dots) if several tie.
+  //    This is best-effort for scan framings we haven't seen — log it so a wrong
+  //    pick surfaces (a mis-forwarded leaf just gets denied by Clap House, which
+  //    is otherwise indistinguishable from a normal denial).
+  const leaves = collectStringValues(d).filter(
+    (s) => s.length >= 4 && !TOKEN_NOISE.test(s) && !/^\d+$/.test(s),
+  );
+  if (!leaves.length) return null;
+  const jwtish = leaves.filter((s) => (s.match(/\./g) ?? []).length >= 2);
+  const pool = jwtish.length ? jwtish : leaves;
+  const chosen = pool.reduce((a, b) => (b.length > a.length ? b : a));
+  log('warn', 'gantner.token_fallback', {
+    cmd: msg.Cmd,
+    chosenLen: chosen.length,
+    jwtShaped: jwtish.length > 0,
+    note: 'no known token field matched — forwarding a heuristic leaf to Clap House.',
+  });
+  return chosen;
+}
+
+/** Short, stable, non-reversible fingerprint of a token — for dedup + logging. */
+export function tokenFingerprint(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
+}
+
+/**
+ * Return a copy of a scan message with the token-bearing leaves replaced by a
+ * fingerprint, so a live single-use token is never written to logs / the capture
+ * ring / the raw dump. Correlation is preserved via the `tok:<fp>` marker.
+ */
+export function redactScanFields(msg: GantnerMessage): GantnerMessage {
+  const clone: GantnerMessage = { ...msg };
+  // Top-level token fields (isAccessMessage accepts them there too).
+  for (const f of TOKEN_FIELDS) {
+    const v = (msg as Record<string, unknown>)[f];
+    if (typeof v === 'string' && v.trim()) (clone as Record<string, unknown>)[f] = `tok:${tokenFingerprint(v.trim())}`;
+  }
+  if (msg.Data && typeof msg.Data === 'object' && !Array.isArray(msg.Data)) {
+    const d: Record<string, unknown> = { ...(msg.Data as Record<string, unknown>) };
+    for (const f of TOKEN_FIELDS) {
+      const v = d[f];
+      if (typeof v === 'string' && v.trim()) d[f] = `tok:${tokenFingerprint(v.trim())}`;
+    }
+    if (Array.isArray(d.Segments)) {
+      d.Segments = (d.Segments as Array<unknown>).map((s) => {
+        if (s && typeof s === 'object' && typeof (s as { Data?: unknown }).Data === 'string') {
+          const seg = s as Record<string, unknown>;
+          const data = (seg.Data as string).trim();
+          return data ? { ...seg, Data: `tok:${tokenFingerprint(data)}` } : seg;
+        }
+        return s;
+      });
+    }
+    clone.Data = d;
+  }
+  return clone;
+}
+
+/**
+ * Stable key for the physical reader that produced a scan, used to collapse the
+ * TWO events one physical scan emits (IO.BarcodeRead + IO.TagInReader) into ONE
+ * decision — independent of how each event encodes the token. Null if unknown.
+ */
+export function readerKey(msg: GantnerMessage): string | null {
+  const d = (msg.Data ?? {}) as Record<string, unknown>;
+  if (typeof d.ReaderId === 'number') return `r${d.ReaderId}`;
+  if (typeof d.Reader === 'number') return `r${d.Reader}`;
+  if (typeof d.ReaderID === 'string' && d.ReaderID.trim()) {
+    const m = d.ReaderID.match(/(\d+)\s*$/);
+    return m ? `r${m[1]}` : `rid:${d.ReaderID.trim()}`;
+  }
+  // Some framings (e.g. FIU.Identification) carry only Data.Device = "READER1".
+  if (typeof d.Device === 'string' && d.Device.trim()) {
+    const m = d.Device.match(/(\d+)\s*$/);
+    return m ? `r${m[1]}` : `dev:${d.Device.trim()}`;
+  }
+  return null;
 }
 
 /* ------------------------------------------------------------------ *
- * GC7 QR template
- * ------------------------------------------------------------------ *
- * The controller's "QR code" config (Mode: Template) is set to:
- *     GANTNER#@Id#@Timestamp#@Challenge
- * '#' is the field separator and @Name are substituted values, so a scanned
- * QR arrives as:
- *     GANTNER#<Id>#<Timestamp>#<Challenge>
- * We must extract <Id> and match THAT against the allow-list — not the whole
- * string. <Timestamp> and <Challenge> are anti-replay / signature material.
+ * Clap House access decision (source of truth)
  * ------------------------------------------------------------------ */
 
-export const QR_PREFIX = 'GANTNER';
-
-export interface GantnerQr {
-  raw: string;
-  prefix: string;
-  id: string;
-  timestamp: string;
-  challenge: string;
+export interface ValidateResult {
+  result: 'granted' | 'denied';
+  /** Present on a denial. Clap House values + our local fail-closed reasons. */
+  denialReason?: string;
 }
 
-/** Parse a `GANTNER#<Id>#<Timestamp>#<Challenge>` payload, or null if it isn't one. */
-export function parseGantnerQr(value: string): GantnerQr | null {
-  if (typeof value !== 'string') return null;
-  const parts = value.split('#');
-  if (parts.length < 4 || parts[0] !== QR_PREFIX) return null;
-  return {
-    raw: value,
-    prefix: parts[0],
-    id: parts[1],
-    timestamp: parts[2],
-    challenge: parts.slice(3).join('#'), // tolerate stray '#' inside the challenge
-  };
+/**
+ * Ask Clap House whether to open the gate for this scan. POSTs the raw token and
+ * gate id to /api/access/validate and returns its verdict. Treats EVERYTHING
+ * that isn't an explicit { result: "granted" } as a denial:
+ *
+ *   - HTTP 400/401/5xx, malformed JSON, network error, timeout → DENIED.
+ *
+ * This is the FAIL-CLOSED guarantee: if Clap House is unreachable or slow, the
+ * gate stays shut. A gate must never open on uncertainty.
+ */
+export async function validateWithClapHouse(token: string, gateId: string): Promise<ValidateResult> {
+  try {
+    const res = await fetch(config.claphouseValidateUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        // Sent verbatim per the contract; empty until GATE_API_KEY is set on
+        // both sides, at which point Clap House starts enforcing it.
+        'x-gate-key': config.gateApiKey,
+      },
+      body: JSON.stringify({ token, gateId }),
+      signal: AbortSignal.timeout(config.validateTimeoutMs),
+    });
+
+    if (!res.ok) {
+      // 400 (no token / bad JSON) or 401 (bad x-gate-key) → keep closed.
+      const denialReason = res.status === 401 ? 'unauthorized' : res.status === 400 ? 'bad_request' : `http_${res.status}`;
+      log('warn', 'claphouse.http_error', { status: res.status, gateId, denialReason });
+      return { result: 'denied', denialReason };
+    }
+
+    const body = (await res.json().catch(() => null)) as { result?: string; denialReason?: string } | null;
+    if (body?.result === 'granted') return { result: 'granted' };
+    return { result: 'denied', denialReason: body?.denialReason ?? 'denied' };
+  } catch (err) {
+    // Unreachable / timed out / DNS / TLS — FAIL CLOSED.
+    const denialReason = (err as Error)?.name === 'TimeoutError' ? 'timeout' : 'unreachable';
+    log('error', 'claphouse.unreachable', { gateId, denialReason, error: (err as Error)?.message });
+    return { result: 'denied', denialReason };
+  }
 }
 
 /**
@@ -168,67 +298,14 @@ export function buildLoginResponse(msg: GantnerMessage): GantnerMessage {
 }
 
 /**
- * Relay map — confirmed from the controller config and the G7 web UI:
- *   Relay 1 = reader 1 / door 1 (Entry),  Relay 2 = reader 2 / door 2 (Exit).
- * The controller pulses the relay for its configured unlock time (3000 ms) and
- * auto-resets it; the web UI exposes this as a relay "pulse".
+ * Door-open command, for reference — CONFIRMED from the controller's own G7 web UI
+ * bundle (wss://<controller>/api): the door is a RELAY, opened with
+ *   { Cmd:"IO.SetRelayState", MT:"Req", Data:{ Id, State:true } }
+ * (Id 1 = Entry relay, 2 = Exit; controller pulses then the backend closes it).
+ * `App.StartUnlockProcess` does NOT exist on this firmware (3.9.1). index.ts builds
+ * and transmits this frame directly using the gate's topology relay — see
+ * unlockTargets()/sendRelay() there.
  */
-export const ENTRY_RELAY_ID = 1;
-export const EXIT_RELAY_ID = 2;
-
-/**
- * Derive the door relay from the reader that produced the scan.
- *   Reader 1 → Relay 1 (door 1),  Reader 2 → Relay 2 (door 2).
- * The scan event carries the reader as `Data.ReaderId` (number, on
- * IO.BarcodeRead) or `Data.ReaderID` (e.g. "BARCODE2", on IO.TagInReader).
- * We open the relay matching whichever reader scanned — so a scan at reader 2
- * opens door 2, not door 1. Defaults to Relay 1 if the reader can't be read.
- */
-export function relayIdForMessage(msg: GantnerMessage): number {
-  const d = (msg.Data ?? {}) as Record<string, unknown>;
-  if (typeof d.ReaderId === 'number' && d.ReaderId >= 1) return d.ReaderId;
-  if (typeof d.ReaderID === 'string') {
-    const m = d.ReaderID.match(/(\d+)\s*$/);
-    if (m) return parseInt(m[1], 10);
-  }
-  return ENTRY_RELAY_ID;
-}
-
-/**
- * (10) Build the door-open command for a GRANTED scan.
- *
- * CONFIRMED from the controller's own G7 web UI bundle (wss://<controller>/api).
- * The web UI opens a door with:
- *
- *   { Cmd:"IO.SetRelayState", MT:"Req", Data:{ Id, State, Device } }
- *
- * Id 1 = Entry door relay, Id 2 = Exit; the controller pulses the relay for its
- * configured unlock time (3000 ms) and auto-resets it. There is NO command named
- * `App.StartUnlockProcess` / `App.StartDenyProcess` anywhere in this firmware
- * (3.9.1 / G7 Advanced Access App v1.9.0) — that earlier reverse-engineered guess
- * was WRONG. The door is a relay.
- *
- *   GRANTED → set the Entry relay on (controller pulses + auto-resets).
- *   DENIED  → null; nothing is sent, the door simply isn't opened. (Negative
- *             reader feedback would be IO.SetStatusLED {ColorOn} / IO.PlaySound,
- *             but the ColorOn value isn't confirmed, so we don't fabricate one.)
- *
- * Whether this is actually transmitted is gated by `config.sendUnlock` in the
- * caller — default OFF (capture-only). The STILL-OPEN question is whether the
- * External Webserver channel honours an outbound IO.SetRelayState Req the same
- * way the authenticated local /api WS does; the live scan test settles it.
- */
-export function buildUnlock(
-  msg: GantnerMessage,
-  decision: 'GRANTED' | 'DENIED',
-): GantnerMessage | null {
-  if (decision !== 'GRANTED') return null;
-  const d = (msg.Data as Record<string, unknown> | undefined) ?? {};
-  const data: Record<string, unknown> = { Id: relayIdForMessage(msg), State: true };
-  // Echo Device only if the scan carried one (confirmed scan events don't).
-  if (d.Device !== undefined) data.Device = d.Device;
-  return { Cmd: 'IO.SetRelayState', MT: 'Req', Data: data };
-}
 
 /** Generic positive acknowledgement for messages we observe but don't yet act on. */
 export function buildAck(msg: GantnerMessage): GantnerMessage {
@@ -248,12 +325,13 @@ export function buildAck(msg: GantnerMessage): GantnerMessage {
 export interface HandleResult {
   /** Message to send back to the controller, or null to stay silent. */
   response: GantnerMessage | null;
-  /** The unlock command we WOULD have sent (logged only, never sent yet). Null on DENIED. */
-  wouldSend?: GantnerMessage | null;
   /** Classification for stats/monitoring. */
   kind?: 'heartbeat' | 'login' | 'access' | 'rsp' | 'other';
-  /** Access decision, when kind === 'access'. */
-  decision?: 'GRANTED' | 'DENIED';
+  /**
+   * Raw scanned token to forward to Clap House, when kind === 'access'. Null when
+   * the scan carried nothing readable (e.g. IO.InvalidTagInReader).
+   */
+  token?: string | null;
 }
 
 export function handleMessage(msg: GantnerMessage): HandleResult {
@@ -280,62 +358,26 @@ export function handleMessage(msg: GantnerMessage): HandleResult {
     return { response, kind: 'login' };
   }
 
-  // (8) Access / scan / identification
+  // (8) Access / scan / identification. The DECISION is no longer made here —
+  // Clap House (https://app.claphouse.co) is the source of truth. We only pull
+  // out the raw scanned token and the candidate relay frame; index.ts then calls
+  // validateWithClapHouse() and pulses the relay on a grant. Forward the token
+  // VERBATIM — never parse, cache, or second-guess it.
   if (isAccessMessage(msg)) {
-    // The identifier can hide anywhere (Data.Barcode, Data.IdValue,
-    // Data.Segments[].Data, ...), so scan the whole payload.
-    const keyed = extractIdentifiers(msg);
-    const deep = [...new Set(collectStringValues(msg.Data ?? {}))];
-
-    // (QR) Expand any GANTNER#<Id>#<Timestamp>#<Challenge> payloads.
-    const qrs = deep.map(parseGantnerQr).filter((q): q is GantnerQr => q !== null);
-
-    const candidates = [...new Set([...keyed, ...deep, ...qrs.map((q) => q.id)])];
-    const matched = candidates.find((id) => ALLOWED_IDENTIFIERS.has(id));
-    const granted = Boolean(matched);
-
-    log(granted ? 'info' : 'warn', 'gantner.access', {
+    const token = extractScanToken(msg);
+    log('info', 'gantner.scan', {
       cmd,
       tid: msg.TID,
-      keyed,
-      qr: qrs.length ? qrs : undefined,
-      decision: granted ? 'GRANTED' : 'DENIED',
-      matched: matched ?? null,
+      hasToken: Boolean(token),
+      tokenLen: token?.length ?? 0,
+      note: token ? undefined : 'no readable token in scan — will be denied locally (no Clap House call).',
     });
-
-    // A QR carries a Challenge + Timestamp for anti-replay/signing. We can't
-    // validate them yet (no secret/algorithm) — surface them as UNVERIFIED so
-    // nobody mistakes "matched the Id" for "the QR is authentic".
-    for (const q of qrs) {
-      log('warn', 'gantner.qr_unverified', {
-        id: q.id,
-        timestamp: q.timestamp,
-        challenge: q.challenge,
-        note: 'QR Challenge signature and Timestamp freshness are NOT validated yet.',
-      });
-    }
-
-    // (10) Build the unlock for a GRANT. Whether it's actually transmitted is
-    // decided by config.sendUnlock in the caller (index.ts).
-    const decision: 'GRANTED' | 'DENIED' = granted ? 'GRANTED' : 'DENIED';
-    const wouldSend = buildUnlock(msg, decision);
-    log(config.sendUnlock ? 'info' : 'warn', 'gantner.unlock', {
-      decision,
-      identifier: matched ?? null,
-      willSend: config.sendUnlock && Boolean(wouldSend),
-      note: !wouldSend
-        ? 'DENIED — no door command.'
-        : config.sendUnlock
-          ? 'LIVE — transmitting IO.SetRelayState to open the Entry door.'
-          : 'CAPTURE — not sent (set GANTNER_SEND_UNLOCK=true to go live).',
-      wouldSend,
-    });
-
-    return { response: null, wouldSend, kind: 'access', decision };
+    return { response: null, kind: 'access', token };
   }
 
   // Anything else (GetDeviceInfo, IO.*, Addon.*, Config.*, Evt notifications):
-  // capture-log it. Only Heartbeat and Login receive responses for now.
-  log('info', 'gantner.unhandled', { cmd, mt, tid: msg.TID, data: msg.Data });
+  // capture-log it. Log only the Data KEYS, not values — an unforeseen framing
+  // could carry a token in a non-standard field, and this path isn't redacted.
+  log('info', 'gantner.unhandled', { cmd, mt, tid: msg.TID, dataKeys: msg.Data ? Object.keys(msg.Data) : [] });
   return { response: null, kind: 'other' };
 }

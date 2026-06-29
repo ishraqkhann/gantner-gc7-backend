@@ -5,12 +5,15 @@
 Express + WebSocket backend (Node.js + TypeScript) for **Gantner GC7.3000** access
 controllers using the **External Webserver** JSON protocol.
 
-Target production endpoint:
+Target production endpoint (Render):
 
 ```
-wss://api.claphouse.club/gantner      (WebSocket — GC7 connects here)
-https://api.claphouse.club/health     (health check → { "ok": true })
+wss://gantner-gc7-backend.onrender.com/gantner   (WebSocket — GC7 connects here)
+https://gantner-gc7-backend.onrender.com/health  (health check → { "ok": true })
 ```
+
+Decisions are delegated to **Clap House** (`https://app.claphouse.co`), the source
+of truth for access.
 
 > Replaces the controller's current External Webserver target
 > `wss://7backend2026.sevenwellness.club`.
@@ -29,18 +32,17 @@ https://api.claphouse.club/health     (health check → { "ok": true })
 | 6 | Responds to `Heartbeat` (exact required format) |
 | 7 | Responds to `Login` with `State: 0`, `Data: {}` |
 | 8 | Detects access/scan messages by `Cmd`/`Data` containing: `Tag`, `Barcode`, `Identification`, `Reader`, `Card`, `Access`, `CheckIn`, `FIU`, `IO.TagInReader`, `IO.InvalidTagInReader` |
-| 9 | Grants only these identifiers (temporary allow-list): `TEST123456`, `HELLO_WORLD`, `12345678` |
-| 10 | Does **not** send an unlock command yet — `placeholderUnlock()` **logs what it would send**. Door-open is **confirmed** to be the relay command `IO.SetRelayState` `Data:{ Id, State, Device }` (`Id 1` = Entry, `2` = Exit), from the controller's own G7 web UI. A GRANT would set the Entry relay on; a DENY sends nothing. (The earlier `App.StartUnlockProcess` guess does **not** exist on this firmware.) |
-| 11 | Writes logs to `./logs/gantner-events.log` |
-| 12 | `GET /status` — live connection/heartbeat/access counters (no identifiers) |
-| 13 | `GET /recent` — last ~120 captured raw packets (newest first; `?all=1` includes heartbeats) |
+| 9 | **Decides access via Clap House** (source of truth): forwards the raw scanned QR token to `POST {CLAPHOUSE_VALIDATE_URL}` and opens only on `{ result: "granted" }`. No local allow-list. **Fails closed** on any timeout/error. |
+| 10 | On a grant, opens the gate with the relay command `IO.SetRelayState` `Data:{ Id, State:true }` (relay pulsed, then auto-closed after `GANTNER_UNLOCK_PULSE_MS`). Gated by `GANTNER_SEND_UNLOCK` (false = shadow mode: validate + record, do not open). |
+| 11 | Writes logs to `./logs/gantner-events.log` (token logged only as a SHA-256 fingerprint, never raw) |
+| 12 | `GET /status` — live connection/heartbeat/access counters + per-connection `serial`/`gateName`/`idleSeconds` (no identifiers) |
+| 13 | `GET /recent` — access **decision feed** `{ at, gateName, decision, denialReason? }` (no token/PII). `?raw=1` returns raw captured packets instead (bring-up; `&all=1` includes heartbeats) |
 
-> **Capture phase:** only `Heartbeat` and `Login` get responses. Access/scan
-> events and everything else (`IO.*`, `FIU.*`, `Addon.*`, `Config.*`) are
-> **logged & captured but not answered** — so we can observe the real GC7
-> traffic before committing to the online grant/unlock flow. Real scan events
-> seen on GC7 v3.9.1 / G7 Advanced Access App: `IO.TagInReader`,
-> `IO.InvalidTagInReader`, `FIU.Identification`.
+> **Decision flow:** `Heartbeat` and `Login` get responses. Each scan is
+> validated against Clap House and the verdict recorded; the gate opens only on a
+> grant and only when `GANTNER_SEND_UNLOCK=true`. A single physical scan emits two
+> events (`IO.BarcodeRead` + `IO.TagInReader`) with the same token — the backend
+> validates **once** per scan (Clap House single-uses the token's `jti`).
 
 ### Message envelope
 
@@ -66,34 +68,29 @@ https://api.claphouse.club/health     (health check → { "ok": true })
 }
 ```
 
-### Access decision (current bring-up behaviour)
+### Access decision (Clap House is the source of truth)
 
-* Identifier in the allow-list → logs `decision: GRANTED` **and** logs the
-  placeholder unlock command under event `gantner.unlock_would_send`
-  (⚠️ **not sent** — the real GC7 door-open command is unconfirmed).
-* Identifier not in the list → logs `decision: DENIED`.
-* Either way the event is acknowledged with a generic `Rsp` (`State: 0`) so the
-  controller doesn't retry. **No door is ever opened yet.**
+On each scan the backend:
 
-### QR template
+1. extracts the **raw scanned token** (`extractScanToken` — `Data.Barcode` /
+   `Data.Tag` / `Data.Identification` / `Data.Segments[].Data`; forwarded verbatim,
+   never parsed),
+2. `POST`s `{ token, gateId }` to `CLAPHOUSE_VALIDATE_URL` with the `x-gate-key`
+   header (`validateWithClapHouse`),
+3. opens the gate **only** on `{ "result": "granted" }`; every denial / HTTP
+   400 / 401 / timeout / network error → **deny** (fail closed),
+4. records the decision (`/recent`) and counters (`/status`).
 
-The controller's **QR code** config (Mode: Template) is set to:
+`denialReason` values come straight from Clap House (`invalid_token`, `expired`,
+`pending`, `blocked`, `outside_hours`, `replay`, `unknown_qr`), plus local
+fail-closed reasons (`timeout`, `unreachable`, `unauthorized`, `bad_request`,
+`invalid_read` for an unreadable scan).
 
-```
-GANTNER#@Id#@Timestamp#@Challenge      →  GANTNER#<Id>#<Timestamp>#<Challenge>
-```
-
-`#` is the field separator; `@Name` are substituted values. So a scanned QR
-arrives as e.g. `GANTNER#TEST123456#1719230400#a1b2c3d4`. The backend:
-
-* deep-scans the whole message (the value may sit in `Data.Barcode`,
-  `Data.IdValue`, or `Data.Segments[].Data`),
-* parses the template and matches the **`<Id>`** field against the allow-list,
-* logs `<Timestamp>` and `<Challenge>` as **unverified** (`gantner.qr_unverified`).
-
-> ⚠️ The `Challenge` is an anti-forgery token. Until it's cryptographically
-> validated (secret/algorithm TBD), a forged `GANTNER#TEST123456#…#…` would pass.
-> Fine for bring-up; **must** be enforced before go-live.
+> The token is an opaque short-lived (≈35 s) single-use JWT. The backend never
+> validates the signature itself — Clap House verifies signature, expiry,
+> single-use, approval status and club hours. So **don't cache, queue, or retry**
+> tokens; a `denied: invalid_token` is a stale/screenshotted code, not a transient
+> error.
 
 ### Authentication
 
@@ -154,8 +151,16 @@ curl http://localhost:3000/health      # {"ok":true}
 | Var | Default | Notes |
 |-----|---------|-------|
 | `PORT` | `3000` | Railway/Render inject their own — don't hardcode in prod. |
-| `GANTNER_ACCESS_TOKEN` | _(empty)_ | Reserved shared secret for Login. Empty = not enforced during bring-up. |
+| `GANTNER_ACCESS_TOKEN` | _(empty)_ | Shared secret the GC7 sends in the `Authorization` header on the WS upgrade. Empty = not enforced. |
 | `HEARTBEAT_INTERVAL` | `30` | `HBI` value advertised back to the controller. |
+| `CLAPHOUSE_VALIDATE_URL` | `https://app.claphouse.co/api/access/validate` | Clap House access-decision endpoint. |
+| `GATE_API_KEY` | _(empty)_ | Sent as `x-gate-key`. Set the **same** value here and in Clap House's Vercel env at the same time (Clap House auto-enforces once set). |
+| `CLAPHOUSE_TIMEOUT_MS` | `5000` | Validate-call timeout. On timeout → **deny** (fail closed). |
+| `GANTNER_SEND_UNLOCK` | `false` | `false` = shadow mode (validate + record, don't open). `true` = open the gate on a Clap-House grant. |
+| `GANTNER_UNLOCK_PULSE_MS` | `3000` | How long the relay stays energized before the backend closes it. |
+| `ADMIN_API_KEY` | _(empty)_ | Enables the destructive `/relay/pulse` & `/relay/close-all` endpoints; callers must send it as `x-admin-key`. Empty = those endpoints return `403`. |
+| `GANTNER_FALLBACK_RELAY` | `2` | Relay to pulse for a grant on a not-yet-identified controller (all live gates here use relay 2). |
+| `GANTNER_LOG_RAW_FRAMES` | `false` | `true` logs full scan frames incl. the live token — **local debug only**. Default redacts token fields. |
 
 `.env` (committed for local dev convenience):
 
@@ -261,54 +266,47 @@ gantner.unlock_would_send   the unlock we WOULD send (not sent yet)
 
 ## Test with a QR / scan
 
-The allow-list values are plain strings, so any QR/barcode encoding one of these
-will be treated as **GRANTED**:
+Access is now decided by Clap House, so grants depend on a real (approved) member
+token, not a fixed string:
 
-```
-TEST123456
-HELLO_WORLD
-12345678
-```
+1. **Clap House admin → Turnstiles → "Test a scan"** — type a member number; it
+   runs the real decision (approved → `granted`; pending → `denied`).
+2. A member's live app QR **is** a valid token — present it to a reader wired to a
+   GC7 and watch the logs: `ws.message_raw` → `gantner.scan` → `access.granted` /
+   `access.denied` (with `denialReason`), then `ws.unlock_sent` on a grant (if
+   `GANTNER_SEND_UNLOCK=true`).
 
-1. Generate a QR for `TEST123456` (any QR generator).
-2. Present it to a reader wired to the GC7.
-3. Watch the logs: you'll see `ws.message_raw` → `ws.message_parsed` →
-   `gantner.access` `decision: GRANTED` → `gantner.unlock_would_send`.
-
-No physical reader handy? Simulate the exact scan frame:
+No physical reader handy? Simulate a scan frame (the decision will be whatever
+Clap House returns for that token — a random string is denied `invalid_token`):
 
 ```bash
-node scripts/test-client.mjs wss://api.claphouse.club/gantner TEST123456
-# or against local:
-node scripts/test-client.mjs ws://localhost:3000/gantner 12345678
+node scripts/test-client.mjs ws://localhost:3000/gantner "<a real Clap House token>"
 ```
+
+Watch the decision feed: `curl http://localhost:3000/recent` (or `/recent?raw=1`
+for raw packets, `/status` for counters).
 
 ---
 
-## Next step (intentionally not done yet)
+## Go-live checklist
 
-The GC7.3000 door-open command is now **confirmed** (from the controller's own G7
-web UI bundle at `wss://<controller>/api`): the door is a **relay**, opened with
+The Clap House decision flow and the relay door-open are both implemented. To go
+live:
 
-```jsonc
-{ "Cmd": "IO.SetRelayState", "MT": "Req", "Data": { "Id": 1, "State": true, "Device": "<echo>" } }
-//  Id 1 = Entry door relay, Id 2 = Exit. Controller pulses the relay for its
-//  configured unlock time (3000 ms) and auto-resets it.
-```
+1. Deploy with `GANTNER_SEND_UNLOCK=false` first — **shadow mode**: every scan is
+   validated against Clap House and recorded to `/recent`/`/status`, but no door
+   opens. Confirm grants/denials look right.
+2. **The one thing to confirm on the hardware:** that the **External Webserver**
+   connection (where this backend lives) actually honours an outbound
+   `IO.SetRelayState` Req. The authenticated local `/api` WS does (it's the web
+   UI's manual door-open), but the on-site brief never confirmed the External
+   Webserver channel does — and it earlier observed scans being decided *locally*,
+   not mirrored to this channel. Verify on a **non-production** door first.
+3. Set `GATE_API_KEY` to the same 32+ char random value here **and** in Clap
+   House's Vercel env at the same time (Clap House auto-enforces it once set).
+4. Flip `GANTNER_SEND_UNLOCK=true`.
 
-`App.StartUnlockProcess` / `App.StartGrantProcess` / `App.StartDenyProcess` **do
-not exist** on this firmware (3.9.1 / G7 Advanced Access App v1.9.0) — that earlier
-guess was wrong. `src/gantner.ts` `placeholderUnlock()` now builds the real
-`IO.SetRelayState` frame (GRANT only; DENY sends nothing), still **logged, never
-sent**.
-
-The remaining unknown is **not the command but the channel**: confirm that the
-**External Webserver** connection (where this backend lives) actually honours an
-outbound `IO.SetRelayState` Req — the authenticated local `/api` WS clearly does
-(it's how the web UI's manual door-open button works), but the External Webserver
-channel may only receive events. Settle via packet capture or a live test on a
-**non-production** door, then flip `placeholderUnlock()` from log-only to send.
-
-> Note: `RegisterEvent` is confirmed as `{"Cmd":"RegisterEvent","Data":{"Event":"<ns>.*"}}`
-> (one namespace per request). Real scan events seen by the web UI: `IO.TagInReader`,
-> `IO.TagLost`, `IO.InvalidTagInReader`, `IO.BarcodeRead`, `FIU.Identification`.
+> Door-open command (confirmed from the controller's own G7 web UI bundle): the
+> door is a **relay** — `{ "Cmd":"IO.SetRelayState", "MT":"Req", "Data":{ "Id":<relay>, "State":true } }`.
+> The backend pulses it then sends `State:false` after `GANTNER_UNLOCK_PULSE_MS`.
+> `App.StartUnlockProcess` does **not** exist on this firmware (3.9.1).

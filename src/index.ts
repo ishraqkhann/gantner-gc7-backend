@@ -6,8 +6,26 @@ import { URL } from 'url';
 
 import { config } from './config';
 import { log, LOG_FILE_PATH } from './logger';
-import { GantnerMessage, handleMessage, collectStringValues } from './gantner';
-import { connections, totals, lastSeen, statusSnapshot, capture, recentMessages } from './stats';
+import {
+  GantnerMessage,
+  handleMessage,
+  collectStringValues,
+  validateWithClapHouse,
+  isAccessMessage,
+  redactScanFields,
+  readerKey,
+  tokenFingerprint,
+} from './gantner';
+import {
+  connections,
+  totals,
+  lastSeen,
+  statusSnapshot,
+  capture,
+  recentMessages,
+  recordDecision,
+  recentDecisions,
+} from './stats';
 import { Gate, gateForSerial, gatesInDoor, serialFromValues } from './topology';
 
 const WS_PATH = '/gantner';
@@ -34,12 +52,20 @@ app.get('/status', (_req, res) => {
   res.json(statusSnapshot());
 });
 
-// Captured raw packets (newest first). Heartbeats hidden unless ?all=1.
-// Bring-up tool to SEE exactly what the GC7 sends.
+// Access DECISION feed (newest first) — read live by the Clap House admin's
+// Access log. Each item: { at, gateName, gate, decision, result, denialReason? }.
+// Contains NO raw token / NO PII. Both `decisions` and `messages` hold the same
+// array so a reader keyed on either wrapper works.
+//   /recent?raw=1   → instead returns the raw captured GC7 packets (bring-up
+//                     tool); add &all=1 to include heartbeats.
 app.get('/recent', (req, res) => {
-  const all = String(req.query.all ?? '') === '1';
-  const items = [...recentMessages].reverse().filter((m) => all || m.cmd !== 'Heartbeat');
-  res.json({ count: items.length, messages: items.slice(0, 60) });
+  if (String(req.query.raw ?? '') === '1') {
+    const all = String(req.query.all ?? '') === '1';
+    const items = [...recentMessages].reverse().filter((m) => all || m.cmd !== 'Heartbeat');
+    return res.json({ count: items.length, messages: items.slice(0, 60) });
+  }
+  const items = [...recentDecisions].reverse().slice(0, 100);
+  res.json({ count: items.length, decisions: items, messages: items });
 });
 
 // Friendly root
@@ -65,6 +91,57 @@ let outboundTid = 9000; // TID for server-originated requests (e.g. RegisterEven
 const UNLOCK_DEDUP_MS = 3000;
 const lastUnlockByRelay = new Map<string, number>();
 
+// Dedup the access decision per PHYSICAL scan. One scan emits BOTH IO.BarcodeRead
+// and IO.TagInReader; Clap House single-uses the token's jti, so deciding twice
+// would waste a round-trip AND get a spurious `replay` denial on the second. We
+// key on the READER (not the token), so the two events collapse even if they
+// encode the token differently, and unreadable scans dedup too. The window must
+// exceed the validate timeout so a retry can't slip through while a call is still
+// in flight. Keyed "<connId>:<readerKey|tokenFp>"; pruned lazily.
+// TOKEN window — long (must exceed the validate timeout): suppresses the SAME
+// token being re-emitted/retried while a validate is still in flight. Distinct
+// members carry distinct tokens, so this never drops a different person.
+const DEDUP_WINDOW_MS = Math.max(UNLOCK_DEDUP_MS, config.validateTimeoutMs + 2000);
+// READER pair window — TIGHT: only to collapse the two events ONE physical scan
+// emits at the same reader (they arrive within ~milliseconds) in the case they
+// encode the token differently. Kept far below human inter-arrival at a single
+// turnstile lane so it can NEVER drop a genuinely distinct member.
+const PAIR_WINDOW_MS = 600;
+const recentScans = new Map<string, number>();
+
+function pruneScans(now: number): void {
+  if (recentScans.size <= 512) return;
+  for (const [k, t] of recentScans) if (now - t > DEDUP_WINDOW_MS) recentScans.delete(k);
+}
+
+/**
+ * TOKEN dedup — slides (refreshes) on every sighting: a token re-emitted within
+ * the window is a duplicate. Safe to slide because a different member = different
+ * token, so this can only ever collapse the SAME scan, never a distinct person.
+ */
+function tokenSeen(key: string): boolean {
+  const now = Date.now();
+  const prev = recentScans.get(key);
+  recentScans.set(key, now);
+  pruneScans(now);
+  return prev !== undefined && now - prev < DEDUP_WINDOW_MS;
+}
+
+/**
+ * READER-pair dedup — does NOT slide: the window is measured from the FIRST event,
+ * so a repeat hit never extends it. That bounds suppression to PAIR_WINDOW_MS from
+ * the first event and guarantees a later, genuinely distinct member (always
+ * seconds away at one lane) is validated normally.
+ */
+function readerPairSeen(key: string): boolean {
+  const now = Date.now();
+  const prev = recentScans.get(key);
+  if (prev !== undefined && now - prev < PAIR_WINDOW_MS) return true; // dup — do NOT refresh
+  recentScans.set(key, now);
+  pruneScans(now);
+  return false;
+}
+
 // Live connection registry: connId -> { ws, identity }. Lets a scan on one
 // controller push IO.SetRelayState down OTHER controllers' connections (the
 // by-direction group). Identity is resolved from GetDeviceInfo on connect.
@@ -87,9 +164,9 @@ interface UnlockTarget {
  * the scanning controller, open the door relay on every connected controller in
  * the SAME direction (entry/exit) — that's the by-direction group. If it isn't
  * identified yet (GetDeviceInfo still in flight, or unknown serial), fall back to
- * opening just the scanning controller using the reader-derived relay.
+ * opening just the scanning controller on the site's confirmed door relay.
  */
-function unlockTargets(scanConnId: number, fallback: GantnerMessage | null): UnlockTarget[] {
+function unlockTargets(scanConnId: number): UnlockTarget[] {
   const me = liveConns.get(scanConnId);
   const out: UnlockTarget[] = [];
   if (me?.gate) {
@@ -103,8 +180,9 @@ function unlockTargets(scanConnId: number, fallback: GantnerMessage | null): Unl
     if (out.length) return out;
   }
   if (me) {
-    const r = fallback ? Number((fallback.Data as Record<string, unknown>)?.Id) : 1;
-    out.push({ connId: scanConnId, ws: me.ws, relay: Number.isFinite(r) ? r : 1, label: 'unidentified-self' });
+    // Unidentified controller: open it on the site's confirmed door relay rather
+    // than a reader-derived number (which could be 1 and open nothing here).
+    out.push({ connId: scanConnId, ws: me.ws, relay: config.fallbackRelay, label: 'unidentified-self' });
   }
   return out;
 }
@@ -226,22 +304,29 @@ wss.on('connection', (ws: WebSocket, req) => {
     }
   }
 
-  ws.on('message', (raw: Buffer, isBinary: boolean) => {
+  // Defined as a function (not inlined) so the listener can attach a single
+  // .catch — an async listener's rejection is NOT routed to ws.on('error'), and
+  // an unhandled one would crash the whole access-control process.
+  const handleFrame = async (raw: Buffer, isBinary: boolean) => {
     const rawText = isBinary ? `<binary ${raw.length} bytes>` : raw.toString('utf8');
-
-    // (5) Log every inbound message — raw first.
-    log('info', 'ws.message_raw', { connId, raw: rawText });
 
     let msg: GantnerMessage;
     try {
       msg = JSON.parse(rawText);
     } catch (err) {
-      log('error', 'ws.parse_error', { connId, raw: rawText, error: (err as Error).message });
+      // A malformed frame may still embed a token — don't echo raw bytes by default.
+      log('error', 'ws.parse_error', { connId, len: rawText.length, raw: config.logRawFrames ? rawText : undefined, error: (err as Error).message });
       return;
     }
 
-    // (5) ...then the parsed form.
-    log('info', 'ws.message_parsed', { connId, parsed: msg });
+    // (5) Log every inbound frame raw + parsed. For SCAN frames, redact the
+    // token-bearing leaves so a live single-use token is never written to stdout
+    // / the on-disk log / the capture ring (override with GANTNER_LOG_RAW_FRAMES).
+    const access = isAccessMessage(msg);
+    const safeMsg = access && !config.logRawFrames ? redactScanFields(msg) : msg;
+    const safeRaw = access && !config.logRawFrames ? JSON.stringify(safeMsg) : rawText;
+    log('info', 'ws.message_raw', { connId, raw: safeRaw });
+    log('info', 'ws.message_parsed', { connId, parsed: safeMsg });
 
     // Controller identification: the GetDeviceInfo response carries the serial.
     // Match it to a known gate so scans here open the right direction group.
@@ -282,8 +367,9 @@ wss.on('connection', (ws: WebSocket, req) => {
       cmd: typeof msg.Cmd === 'string' ? msg.Cmd : undefined,
       mt: typeof msg.MT === 'string' ? msg.MT : undefined,
       isAccess: result.kind === 'access',
-      raw: rawText,
-      parsed: msg,
+      // Redacted for scans so the ring buffer (and /recent?raw=1) never holds a token.
+      raw: safeRaw,
+      parsed: safeMsg,
     });
     const conn = connections.get(connId);
     if (conn) {
@@ -300,13 +386,6 @@ wss.on('connection', (ws: WebSocket, req) => {
         totals.logins += 1;
         lastSeen.loginAt = seenAt;
         break;
-      case 'access':
-        totals.accessEvents += 1;
-        lastSeen.accessAt = seenAt;
-        lastSeen.accessDecision = result.decision ?? null;
-        if (result.decision === 'GRANTED') totals.accessGranted += 1;
-        else totals.accessDenied += 1;
-        break;
     }
 
     if (result.response) {
@@ -314,33 +393,127 @@ wss.on('connection', (ws: WebSocket, req) => {
       log('info', 'ws.message_sent', { connId, sent: result.response });
     }
 
-    // LIVE unlock: on a granted scan, open BOTH barriers in the scanning
-    // controller's DIRECTION (entry or exit). Gated by GANTNER_SEND_UNLOCK.
-    if (config.sendUnlock && result.kind === 'access' && result.decision === 'GRANTED') {
-      const targets = unlockTargets(connId, result.wouldSend ?? null);
-      const now = Date.now();
-      for (const t of targets) {
-        const key = `${t.connId}:${t.relay}`;
-        const prev = lastUnlockByRelay.get(key) ?? 0;
-        if (now - prev < UNLOCK_DEDUP_MS) {
-          log('info', 'ws.unlock_skipped_dedup', { fromConn: connId, target: t.label, relay: t.relay, sinceMs: now - prev });
-          continue;
+    // ---- access decision (Clap House is the source of truth) ----
+    if (result.kind === 'access') {
+      const lc = liveConns.get(connId);
+      const gateId = lc?.gate?.name ?? conn?.serial ?? 'unidentified';
+      const serial = conn?.serial;
+      const token = result.token ?? null;
+      const tokenFp = token ? tokenFingerprint(token) : undefined; // hash only — never the token
+      const rk = readerKey(msg);
+
+      // Dedup per PHYSICAL scan BEFORE counting.
+      if (token) {
+        //  • TOKEN window (long) suppresses the controller RE-emitting the same scan
+        //    while a validate is in flight (would burn the jti → spurious `replay`).
+        //  • READER-pair window (tight, non-sliding) collapses the BarcodeRead +
+        //    TagInReader pair even if they encode the token differently.
+        //  Different members carry different tokens AND scan a single lane seconds
+        //  apart, so neither window can drop a distinct person.
+        const tokenDup = tokenSeen(`${connId}:t:${tokenFp}`);
+        const readerDup = rk ? readerPairSeen(`${connId}:r:${rk}`) : false;
+        if (tokenDup || readerDup) {
+          log('info', 'access.dedup_skip', { connId, gate: gateId, tokenFp, by: tokenDup ? 'token' : 'reader' });
+          return;
         }
-        lastUnlockByRelay.set(key, now);
-        const unlock = { Cmd: 'IO.SetRelayState', MT: 'Req', Data: { Id: t.relay, State: true }, TID: ++outboundTid };
-        t.ws.send(JSON.stringify(unlock));
-        capture({ ts: new Date().toISOString(), connId: t.connId, dir: 'out', cmd: 'IO.SetRelayState', mt: 'Req', isAccess: false, raw: JSON.stringify(unlock), parsed: unlock });
-        log('warn', 'ws.unlock_sent', { fromConn: connId, targetConn: t.connId, gate: t.label, relay: t.relay, tid: unlock.TID });
-        // PULSE: close the relay after the unlock time so the barrier doesn't
-        // latch open. State:true latches on this firmware — we must reset it.
-        scheduleRelayClose(t.ws, t.connId, t.relay, t.label);
+      } else if (rk && readerPairSeen(`${connId}:i:${rk}`)) {
+        // Unreadable scan (e.g. IO.InvalidTagInReader). Dedup its own pair in a
+        // SEPARATE namespace (`i:`) so it can never gate a readable scan, nor be
+        // gated by one. Then fall through to the local deny below.
+        log('info', 'access.dedup_skip', { connId, gate: gateId, by: 'invalid-reader' });
+        return;
+      }
+
+      totals.accessEvents += 1;
+      lastSeen.accessAt = seenAt;
+
+      // No readable token (e.g. IO.InvalidTagInReader) → deny locally; there is
+      // nothing to validate, so we never call Clap House.
+      if (!token) {
+        totals.accessDenied += 1;
+        lastSeen.accessDecision = 'DENIED';
+        recordDecision({ at: seenAt, gateName: gateId, serial, decision: 'denied', denialReason: 'invalid_read' });
+        log('warn', 'access.denied', { connId, gate: gateId, denialReason: 'invalid_read', note: 'no readable token in scan' });
+        return;
+      }
+
+      // Ask Clap House. validateWithClapHouse FAILS CLOSED on any error/timeout.
+      const decision = await validateWithClapHouse(token, gateId);
+      // Keep the TOKEN entry warm across the (possibly slow) call so the same scan
+      // re-emitted during/just after the round-trip can't trigger a second validate.
+      // (Deliberately NOT the reader window — that must stay non-sliding.)
+      if (tokenFp) recentScans.set(`${connId}:t:${tokenFp}`, Date.now());
+      const granted = decision.result === 'granted';
+
+      lastSeen.accessDecision = granted ? 'GRANTED' : 'DENIED';
+      if (granted) totals.accessGranted += 1;
+      else totals.accessDenied += 1;
+
+      recordDecision({ at: seenAt, gateName: gateId, serial, decision: decision.result, denialReason: decision.denialReason });
+      log(granted ? 'warn' : 'info', granted ? 'access.granted' : 'access.denied', {
+        connId,
+        gate: gateId,
+        tokenFp,
+        decision: decision.result,
+        denialReason: decision.denialReason,
+      });
+
+      // Open the barrier(s) ONLY on a grant AND only when live. With
+      // GANTNER_SEND_UNLOCK=false the decision is still recorded (shadow mode) but
+      // no door opens — safe to deploy before flipping the live switch.
+      if (granted && config.sendUnlock) {
+        const targets = unlockTargets(connId);
+        if (!targets.length) {
+          // Granted but nothing to pulse — e.g. the connection dropped during the
+          // validate. Recorded as granted, but be explicit no door opened.
+          log('warn', 'access.granted_no_target', {
+            connId,
+            gate: gateId,
+            note: 'granted but no open controller to pulse — door NOT opened.',
+          });
+        }
+        const now = Date.now();
+        for (const t of targets) {
+          const key = `${t.connId}:${t.relay}`;
+          const prev = lastUnlockByRelay.get(key) ?? 0;
+          if (now - prev < UNLOCK_DEDUP_MS) {
+            log('info', 'ws.unlock_skipped_dedup', { fromConn: connId, target: t.label, relay: t.relay, sinceMs: now - prev });
+            continue;
+          }
+          lastUnlockByRelay.set(key, now);
+          const unlock = { Cmd: 'IO.SetRelayState', MT: 'Req', Data: { Id: t.relay, State: true }, TID: ++outboundTid };
+          if (t.ws.readyState !== WebSocket.OPEN) continue;
+          t.ws.send(JSON.stringify(unlock));
+          capture({ ts: new Date().toISOString(), connId: t.connId, dir: 'out', cmd: 'IO.SetRelayState', mt: 'Req', isAccess: false, raw: JSON.stringify(unlock), parsed: unlock });
+          log('warn', 'ws.unlock_sent', { fromConn: connId, targetConn: t.connId, gate: t.label, relay: t.relay, tid: unlock.TID });
+          // PULSE: close the relay after the unlock time so the barrier doesn't
+          // latch open. State:true latches on this firmware — we must reset it.
+          scheduleRelayClose(t.ws, t.connId, t.relay, t.label);
+        }
+      } else if (granted) {
+        log('warn', 'access.granted_capture_only', {
+          connId,
+          gate: gateId,
+          note: 'GANTNER_SEND_UNLOCK=false — decision recorded but door NOT opened. Set true to go live.',
+        });
       }
     }
+  };
+
+  ws.on('message', (raw: Buffer, isBinary: boolean) => {
+    handleFrame(raw, isBinary).catch((err) =>
+      log('error', 'ws.handler_error', { connId, error: (err as Error)?.message }),
+    );
   });
 
   ws.on('close', (code, reason) => {
     connections.delete(connId);
     liveConns.delete(connId);
+    // Drop this connection's relay-dedup entries so the map can't grow unbounded
+    // across the controllers' frequent reconnects (connId is monotonic).
+    for (const key of lastUnlockByRelay.keys()) {
+      if (key.startsWith(`${connId}:`)) lastUnlockByRelay.delete(key);
+    }
     log('info', 'ws.closed', { connId, code, reason: reason.toString() });
   });
 
@@ -349,10 +522,32 @@ wss.on('connection', (ws: WebSocket, req) => {
   });
 });
 
+/**
+ * Guard for the destructive relay-control endpoints. They open/close physical
+ * barriers directly, bypassing Clap House and the GANTNER_SEND_UNLOCK switch, so
+ * they are DISABLED unless ADMIN_API_KEY is set AND the caller presents a matching
+ * `x-admin-key` header (constant-time compare). Returns true if allowed.
+ */
+function requireAdmin(req: express.Request, res: express.Response): boolean {
+  if (!config.adminKey) {
+    res.status(403).json({ ok: false, error: 'relay control disabled — set ADMIN_API_KEY to enable' });
+    return false;
+  }
+  const provided = Buffer.from((req.headers['x-admin-key'] ?? '').toString());
+  const expected = Buffer.from(config.adminKey);
+  if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) {
+    log('warn', 'http.relay_auth_rejected', { path: req.path, ip: (req.headers['x-forwarded-for'] ?? '').toString() || req.ip });
+    res.status(401).json({ ok: false, error: 'missing/invalid x-admin-key' });
+    return false;
+  }
+  return true;
+}
+
 // RECOVERY: force-close door relays on every connected controller. Use to clear
 // barriers that got latched open. Closes relays 1 & 2 (the door relays in play)
-// on all connections, or a specific relay via ?id=N.
+// on all connections, or a specific relay via ?id=N. ADMIN-ONLY.
 app.get('/relay/close-all', (req, res) => {
+  if (!requireAdmin(req, res)) return;
   const only = req.query.id ? [parseInt(String(req.query.id), 10)] : [1, 2];
   let sent = 0;
   const targets: Array<{ connId: number; gate: string; relays: number[] }> = [];
@@ -369,9 +564,9 @@ app.get('/relay/close-all', (req, res) => {
 });
 
 // COMMISSIONING: manually pulse one relay on one connection, to map which relay
-// opens which physical door. e.g. /relay/pulse?conn=1&id=2
-// (NOTE: no auth — commissioning tool. Protect or remove before production.)
+// opens which physical door. e.g. /relay/pulse?conn=1&id=2  ADMIN-ONLY.
 app.get('/relay/pulse', (req, res) => {
+  if (!requireAdmin(req, res)) return;
   const cid = parseInt(String(req.query.conn), 10);
   const id = parseInt(String(req.query.id), 10);
   const lc = liveConns.get(cid);
@@ -387,6 +582,23 @@ app.get('/relay/pulse', (req, res) => {
 
 /* ----------------------------- boot ------------------------------ */
 
+// Sanity-check the access source-of-truth URL — it decides who gets in, so a
+// typo'd scheme/host would forward live tokens in cleartext or to the wrong host.
+(() => {
+  try {
+    const u = new URL(config.claphouseValidateUrl);
+    const localish = ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname);
+    if (u.protocol !== 'https:' && !localish) {
+      log('warn', 'config.insecure_validate_url', { url: config.claphouseValidateUrl, note: 'not https — tokens would be forwarded in cleartext' });
+    }
+    if (u.hostname !== 'app.claphouse.co' && !localish) {
+      log('warn', 'config.unexpected_validate_host', { host: u.hostname, note: 'access decision host is not app.claphouse.co' });
+    }
+  } catch {
+    log('error', 'config.bad_validate_url', { url: config.claphouseValidateUrl, note: 'unparseable — every scan will FAIL CLOSED (deny)' });
+  }
+})();
+
 server.listen(config.port, () => {
   log('info', 'server.listening', {
     port: config.port,
@@ -394,7 +606,21 @@ server.listen(config.port, () => {
     health: '/health',
     logFile: LOG_FILE_PATH,
     tokenEnforced: Boolean(config.accessToken),
+    validateUrl: config.claphouseValidateUrl,
+    gateKeySet: Boolean(config.gateApiKey),
+    sendUnlock: config.sendUnlock,
+    adminEnabled: Boolean(config.adminKey),
   });
+});
+
+// Last-resort safety nets: a single bad frame or stray rejection must NOT take
+// the whole access-control process down (that would drop all controllers). The
+// system fails closed (no door opens on its own), so staying up is correct.
+process.on('unhandledRejection', (reason) => {
+  log('error', 'process.unhandled_rejection', { error: reason instanceof Error ? reason.message : String(reason) });
+});
+process.on('uncaughtException', (err) => {
+  log('error', 'process.uncaught_exception', { error: (err as Error)?.message, stack: (err as Error)?.stack });
 });
 
 const shutdown = (signal: string) => {

@@ -37,7 +37,10 @@ export const GATES: Record<string, Gate> = {
   '2326030447': { serial: '2326030447', name: 'R3_Entry_Right', door: 1, side: 'R', doorRelay: 2 },
   // Group 2 — parked (dead hardware)
   '2326030171': { serial: '2326030171', name: 'R4_Entry_Left', door: 2, side: 'L', doorRelay: 2 }, // stuck leaf
-  '2326030167': { serial: '2326030167', name: 'R2_Exit_Left', door: 2, side: 'R', doorRelay: 2 }, // .42 offline
+  // Named R1_Exit_Left per the Clap House handoff §4 (its gateName for this serial).
+  // The installer's GAT-manager name for this unit was "R2_Exit_Left" (.42 bench
+  // unit) — kept aligned to the integration contract; Clap House matches by serial.
+  '2326030167': { serial: '2326030167', name: 'R1_Exit_Left', door: 2, side: 'R', doorRelay: 2 }, // .42 offline
 };
 
 export const KNOWN_SERIALS = Object.keys(GATES);
